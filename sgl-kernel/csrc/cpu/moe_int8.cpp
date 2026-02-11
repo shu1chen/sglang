@@ -951,6 +951,16 @@ void fused_experts_int8_kernel_impl(
 // Optimized oneDNN-based implementation
 // Uses oneDNN matmul with pre-reordered weights, user-managed scratchpad
 // for thread safety, and parallel_2d/loop_2d for cache-friendly threading.
+//
+// Key optimizations:
+// - Weights are unpacked from VNNI and reordered with format_tag::any once,
+//   then cached globally keyed by source pointer.
+// - C API (dnnl_primitive_execute) with stack-allocated args avoids
+//   unordered_map and shared_ptr overhead per iteration.
+// - Flat lookup tables for O(1) weight entry access in hot loop.
+// - Thread-local stream/memory handles cached to avoid per-parallel_2d
+//   object creation overhead.
+// - Per-thread scratchpad with scratchpad_mode::user for thread safety.
 // ============================================================================
 
 namespace {
@@ -1064,6 +1074,139 @@ inline const OneDNNWeightCache::CacheEntry* get_or_create_cached_weight(
   return &it->second;
 }
 
+// ---- Thread-local dnnl handle cache ----
+// Avoids creating dnnl::stream, dnnl::memory objects (shared_ptr overhead)
+// on every parallel_2d invocation. Handles are created once per thread and
+// resized/reconfigured as needed.
+struct ThreadLocalHandles {
+  // Stream
+  dnnl::stream stream;
+  dnnl_stream_t raw_stream;
+
+  // Stage 1 handles
+  dnnl::memory a1_mem;       // [BLOCK_M, K]
+  dnnl::memory c1_0_mem;     // [BLOCK_M, BLOCK_N]
+  dnnl::memory c1_1_mem;     // [BLOCK_M, BLOCK_N]
+  dnnl::memory sp1_mem;      // scratchpad
+  dnnl_memory_t raw_a1;
+  dnnl_memory_t raw_c1_0;
+  dnnl_memory_t raw_c1_1;
+  dnnl_memory_t raw_sp1;
+
+  // Stage 2 handles
+  dnnl::memory a2_mem;       // [BLOCK_M, IC]
+  dnnl::memory c2_mem;       // [BLOCK_M, BLOCK_N]
+  dnnl::memory sp2_mem;      // scratchpad
+  dnnl_memory_t raw_a2;
+  dnnl_memory_t raw_c2;
+  dnnl_memory_t raw_sp2;
+
+  // Config tracking to avoid re-creation
+  int64_t configured_K = 0;
+  int64_t configured_IC = 0;
+  int64_t configured_BLOCK_N = 0;
+  int64_t configured_BLOCK_M = 0;
+  size_t configured_sp1_size = 0;
+  size_t configured_sp2_size = 0;
+
+  // Pointer tracking to avoid redundant dnnl_memory_set_data_handle calls
+  void* s1_a_ptr = nullptr;
+  void* s1_c0_ptr = nullptr;
+  void* s1_c1_ptr = nullptr;
+  void* s2_a_ptr = nullptr;
+  void* s2_c_ptr = nullptr;
+
+  bool initialized = false;
+
+  void ensure_stage1(dnnl::engine& eng, int64_t BLOCK_M_val, int64_t K_val,
+                     int64_t BLOCK_N_val, const dnnl::memory::desc& sp_md,
+                     uint8_t* A_buf, int32_t* C0_buf, int32_t* C1_buf) {
+    using namespace dnnl;
+    size_t sp_size = sp_md.get_size();
+    if (!initialized || configured_K != K_val || configured_BLOCK_M != BLOCK_M_val ||
+        configured_BLOCK_N != BLOCK_N_val || configured_sp1_size != sp_size) {
+      stream = dnnl::stream(eng);
+      raw_stream = stream.get();
+
+      memory::desc a_md({BLOCK_M_val, K_val}, memory::data_type::u8, memory::format_tag::ab);
+      memory::desc c_md({BLOCK_M_val, BLOCK_N_val}, memory::data_type::s32, memory::format_tag::ab);
+      a1_mem = memory(a_md, eng, A_buf);
+      c1_0_mem = memory(c_md, eng, C0_buf);
+      c1_1_mem = memory(c_md, eng, C1_buf);
+      raw_a1 = a1_mem.get();
+      raw_c1_0 = c1_0_mem.get();
+      raw_c1_1 = c1_1_mem.get();
+
+      if (sp_size > 0) {
+        sp1_mem = memory(sp_md, eng);
+      }
+      raw_sp1 = sp1_mem.get(true);
+
+      configured_K = K_val;
+      configured_BLOCK_M = BLOCK_M_val;
+      configured_BLOCK_N = BLOCK_N_val;
+      configured_sp1_size = sp_size;
+      initialized = true;
+      s1_a_ptr = A_buf;
+      s1_c0_ptr = C0_buf;
+      s1_c1_ptr = C1_buf;
+    } else if (s1_a_ptr != A_buf || s1_c0_ptr != C0_buf || s1_c1_ptr != C1_buf) {
+      // Only update data pointers when they actually change
+      dnnl_memory_set_data_handle(raw_a1, A_buf);
+      dnnl_memory_set_data_handle(raw_c1_0, C0_buf);
+      dnnl_memory_set_data_handle(raw_c1_1, C1_buf);
+      s1_a_ptr = A_buf;
+      s1_c0_ptr = C0_buf;
+      s1_c1_ptr = C1_buf;
+    }
+    // else: same config + same pointers → no-op (fast path)
+  }
+
+  void ensure_stage2(dnnl::engine& eng, int64_t BLOCK_M_val, int64_t IC_val,
+                     int64_t BLOCK_N_val, const dnnl::memory::desc& sp_md,
+                     uint8_t* A_buf, int32_t* C_buf) {
+    using namespace dnnl;
+    size_t sp_size = sp_md.get_size();
+    if (!initialized || configured_IC != IC_val ||
+        configured_sp2_size != sp_size) {
+      if (!initialized) {
+        stream = dnnl::stream(eng);
+        raw_stream = stream.get();
+        initialized = true;
+      }
+
+      memory::desc a_md({BLOCK_M_val, IC_val}, memory::data_type::u8, memory::format_tag::ab);
+      memory::desc c_md({BLOCK_M_val, BLOCK_N_val}, memory::data_type::s32, memory::format_tag::ab);
+      a2_mem = memory(a_md, eng, A_buf);
+      c2_mem = memory(c_md, eng, C_buf);
+      raw_a2 = a2_mem.get();
+      raw_c2 = c2_mem.get();
+
+      if (sp_size > 0) {
+        sp2_mem = memory(sp_md, eng);
+      }
+      raw_sp2 = sp2_mem.get(true);
+
+      configured_IC = IC_val;
+      configured_sp2_size = sp_size;
+      s2_a_ptr = A_buf;
+      s2_c_ptr = C_buf;
+    } else if (s2_c_ptr != C_buf) {
+      // A pointer changes in inner loop via dnnl_memory_set_data_handle
+      // C pointer is stable per thread — only update if changed
+      dnnl_memory_set_data_handle(raw_c2, C_buf);
+      s2_c_ptr = C_buf;
+    }
+    // else: same config + same pointers → no-op (fast path)
+  }
+};
+
+// Thread-local storage for handles — avoids per-parallel_2d creation overhead
+inline ThreadLocalHandles& get_thread_handles() {
+  static thread_local ThreadLocalHandles handles;
+  return handles;
+}
+
 }  // anonymous namespace
 
 template <typename scalar_t>
@@ -1123,7 +1266,6 @@ void fused_experts_int8_kernel_impl(
   std::vector<const OneDNNWeightCache::CacheEntry*> w1_entries(w1_entries_size);
   {
     const int8_t* w1_base = packed_w1;
-    auto& wcache = OneDNNWeightCache::instance();
     for (int64_t e = 0; e < E; ++e) {
       for (int64_t nb = 0; nb < NB; ++nb) {
         const int8_t* p0 = w1_base + e * stride_e + nb * BLOCK_N * stride_n;
@@ -1135,8 +1277,8 @@ void fused_experts_int8_kernel_impl(
   }
 
   // Stage 1: w1 matmul using parallel_2d + loop_2d
-  // Uses C API dnnl_primitive_execute with stack-allocated args to avoid
-  // unordered_map overhead and shared_ptr copies per iteration.
+  // Uses thread-local cached handles + C API dnnl_primitive_execute
+  // with stack-allocated args to minimize overhead.
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
@@ -1145,29 +1287,25 @@ void fused_experts_int8_kernel_impl(
 
     alignas(64) float As[BLOCK_M];
 
-    // Thread-local oneDNN stream & memory objects (created once per thread)
-    stream s(eng);
-    memory::desc a_md({BLOCK_M, K}, memory::data_type::u8, memory::format_tag::ab);
-    memory::desc c_md({BLOCK_M, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
-    auto a_mem = memory(a_md, eng, A);
-    auto c0_mem = memory(c_md, eng, C0);
-    auto c1_mem = memory(c_md, eng, C1);
+    // Use thread-local cached handles to avoid creating dnnl objects each time
+    auto& th = get_thread_handles();
+    // A pointer is stable for this thread — set once, never changes
+    th.ensure_stage1(eng, BLOCK_M, K, BLOCK_N, w1_entries[0]->scratchpad_md, A, C0, C1);
 
-    // Per-thread scratchpad
-    dnnl::memory scratchpad_mem;
-    {
-      auto* sample = w1_entries[0];
-      if (sample && sample->scratchpad_md.get_size() > 0) {
-        scratchpad_mem = memory(sample->scratchpad_md, eng);
-      }
-    }
-
-    // Cache raw handles for C API execution (avoid shared_ptr overhead)
-    dnnl_memory_t raw_a = a_mem.get();
-    dnnl_memory_t raw_c0 = c0_mem.get();
-    dnnl_memory_t raw_c1 = c1_mem.get();
-    dnnl_memory_t raw_sp = scratchpad_mem.get(true);  // allow_empty=true
-    dnnl_stream_t raw_s = s.get();
+    // Pre-build exec_args templates — only weight pointer changes per iteration
+    dnnl_exec_arg_t exec_args0[] = {
+        {DNNL_ARG_SRC, th.raw_a1},
+        {DNNL_ARG_WEIGHTS, nullptr},  // filled per iteration
+        {DNNL_ARG_DST, th.raw_c1_0},
+        {DNNL_ARG_SCRATCHPAD, th.raw_sp1}
+    };
+    dnnl_exec_arg_t exec_args1[] = {
+        {DNNL_ARG_SRC, th.raw_a1},
+        {DNNL_ARG_WEIGHTS, nullptr},  // filled per iteration
+        {DNNL_ARG_DST, th.raw_c1_1},
+        {DNNL_ARG_SCRATCHPAD, th.raw_sp1}
+    };
+    dnnl_stream_t raw_s = th.raw_stream;
 
     int64_t last_mb = -1;
     int64_t cur_m_size = 0;
@@ -1194,28 +1332,15 @@ void fused_experts_int8_kernel_impl(
           copy_stub(A + m * K, Aq_tmp + index * K, K);
           As[m] = As_tmp[index];
         }
-        dnnl_memory_set_data_handle(raw_a, A);
+        // No dnnl_memory_set_data_handle needed — A buffer pointer is stable per thread
       }
 
-      auto* entry0 = w1_entries[expert_id * 2 * NB + nb];
-      auto* entry1 = w1_entries[expert_id * 2 * NB + NB + nb];
+      // Only update weight pointers in pre-built exec_args
+      exec_args0[1].memory = w1_entries[expert_id * 2 * NB + nb]->raw_weight;
+      exec_args1[1].memory = w1_entries[expert_id * 2 * NB + NB + nb]->raw_weight;
 
-      // C API execute: stack-allocated args, no hash map, no shared_ptr copies
-      dnnl_exec_arg_t exec_args0[] = {
-          {DNNL_ARG_SRC, raw_a},
-          {DNNL_ARG_WEIGHTS, entry0->raw_weight},
-          {DNNL_ARG_DST, raw_c0},
-          {DNNL_ARG_SCRATCHPAD, raw_sp}
-      };
-      dnnl_exec_arg_t exec_args1[] = {
-          {DNNL_ARG_SRC, raw_a},
-          {DNNL_ARG_WEIGHTS, entry1->raw_weight},
-          {DNNL_ARG_DST, raw_c1},
-          {DNNL_ARG_SCRATCHPAD, raw_sp}
-      };
-
-      dnnl_primitive_execute(entry0->raw_primitive, raw_s, 4, exec_args0);
-      dnnl_primitive_execute(entry1->raw_primitive, raw_s, 4, exec_args1);
+      dnnl_primitive_execute(w1_entries[expert_id * 2 * NB + nb]->raw_primitive, raw_s, 4, exec_args0);
+      dnnl_primitive_execute(w1_entries[expert_id * 2 * NB + NB + nb]->raw_primitive, raw_s, 4, exec_args1);
 
       const int64_t offset = offsets[mb];
       silu_and_mul<scalar_t, BLOCK_N>(
@@ -1251,38 +1376,43 @@ void fused_experts_int8_kernel_impl(
     }
   }
 
+  // Pre-allocate per-thread A padding buffers for Stage 2 to avoid
+  // heap allocation (std::vector) inside parallel_2d.
+  // Need BLOCK_M * IC bytes per thread. If A_tmp per-thread buffer (BLOCK_M * K)
+  // is large enough (K >= IC), reuse it; otherwise allocate once.
+  const bool need_a2_pad = (K < IC);
+  std::vector<uint8_t> a2_pad_pool;
+  int num_threads = 1;
+#if defined(_OPENMP)
+  num_threads = omp_get_max_threads();
+#endif
+  if (need_a2_pad) {
+    a2_pad_pool.resize(num_threads * BLOCK_M * IC, 0);
+  }
+
   // Stage 2: w2 matmul using parallel_2d + loop_2d (C API execution)
   parallel_2d(MB, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
 
-    uint8_t* __restrict__ A_pad = (K >= IC) ? (A_tmp + tid * BLOCK_M * K) : nullptr;
-    std::vector<uint8_t> A_pad_heap;
-    if (K < IC) {
-      A_pad_heap.resize(BLOCK_M * IC, 0);
-      A_pad = A_pad_heap.data();
-    }
+    uint8_t* __restrict__ A_pad = need_a2_pad
+        ? (a2_pad_pool.data() + tid * BLOCK_M * IC)
+        : (A_tmp + tid * BLOCK_M * K);
 
-    stream s(eng);
-    memory::desc a_md({BLOCK_M, IC}, memory::data_type::u8, memory::format_tag::ab);
-    memory::desc c_md({BLOCK_M, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
-    auto a_mem = memory(a_md, eng, A_pad);
-    auto c_mem = memory(c_md, eng, C32);
+    // Use thread-local cached handles
+    auto& th = get_thread_handles();
+    th.ensure_stage2(eng, BLOCK_M, IC, BLOCK_N, w2_entries[0]->scratchpad_md, A_pad, C32);
 
-    dnnl::memory scratchpad_mem;
-    {
-      auto* sample = w2_entries[0];
-      if (sample && sample->scratchpad_md.get_size() > 0) {
-        scratchpad_mem = memory(sample->scratchpad_md, eng);
-      }
-    }
-
-    // Cache raw handles for C API execution
-    dnnl_memory_t raw_a = a_mem.get();
-    dnnl_memory_t raw_c = c_mem.get();
-    dnnl_memory_t raw_sp = scratchpad_mem.get(true);
-    dnnl_stream_t raw_s = s.get();
+    // Pre-build exec_args template — only weight and src pointers change
+    dnnl_exec_arg_t exec_args[] = {
+        {DNNL_ARG_SRC, th.raw_a2},
+        {DNNL_ARG_WEIGHTS, nullptr},  // filled per iteration
+        {DNNL_ARG_DST, th.raw_c2},
+        {DNNL_ARG_SCRATCHPAD, th.raw_sp2}
+    };
+    dnnl_stream_t raw_s = th.raw_stream;
+    dnnl_memory_t raw_a = th.raw_a2;
 
     int64_t last_mb = -1;  // track last mb to skip redundant A setup
 
@@ -1299,29 +1429,22 @@ void fused_experts_int8_kernel_impl(
       const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
       const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + BLOCK_N * IC);
 
-      auto* entry = w2_entries[expert_id * NB2 + nb];
-
       if (mb != last_mb) {
         last_mb = mb;
-        const uint8_t* A_ptr;
         if (m_size < BLOCK_M) {
+          // Need to pad — copy + zero-fill
           std::memcpy(A_pad, A_orig, m_size * IC);
           std::memset(A_pad + m_size * IC, 0, (BLOCK_M - m_size) * IC);
-          A_ptr = A_pad;
+          dnnl_memory_set_data_handle(raw_a, A_pad);
         } else {
-          A_ptr = A_orig;
+          // m_size == BLOCK_M — use A_orig directly, no copy needed
+          dnnl_memory_set_data_handle(raw_a, const_cast<uint8_t*>(A_orig));
         }
-        dnnl_memory_set_data_handle(raw_a, const_cast<uint8_t*>(A_ptr));
       }
 
-      dnnl_exec_arg_t exec_args[] = {
-          {DNNL_ARG_SRC, raw_a},
-          {DNNL_ARG_WEIGHTS, entry->raw_weight},
-          {DNNL_ARG_DST, raw_c},
-          {DNNL_ARG_SCRATCHPAD, raw_sp}
-      };
+      exec_args[1].memory = w2_entries[expert_id * NB2 + nb]->raw_weight;
 
-      dnnl_primitive_execute(entry->raw_primitive, raw_s, 4, exec_args);
+      dnnl_primitive_execute(w2_entries[expert_id * NB2 + nb]->raw_primitive, raw_s, 4, exec_args);
 
       scale_C<BLOCK_N>(C, C32, As, Bs, Bcomp, m_size);
 
