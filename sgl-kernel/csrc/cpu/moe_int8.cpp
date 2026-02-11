@@ -5,6 +5,9 @@
 #ifdef SGLANG_USE_ONEDNN_MOE
 #include "oneapi/dnnl/dnnl.hpp"
 #include <vector>
+#include <unordered_map>
+#include <string>
+#include <mutex>
 #endif
 
 namespace {
@@ -828,9 +831,50 @@ void fused_experts_int8_kernel_impl(
 
 #elif SGLANG_USE_ONEDNN_MOE == 1
 // ============================================================================
-// oneDNN-based implementation matching baseline structure
-// Uses oneDNN matmul primitive instead of brgemm/tinygemm kernels
+// Optimized oneDNN-based implementation
+// Uses oneDNN matmul with format_tag::any and cached weight reordering
 // ============================================================================
+
+namespace {
+
+// Cache structure for reordered weights and primitives
+struct WeightCache {
+  std::unordered_map<std::string, dnnl::memory> reordered_weights;
+  std::unordered_map<std::string, dnnl::matmul::primitive_desc> primitive_descs;
+  std::unordered_map<std::string, dnnl::matmul> primitives;
+  std::mutex mutex;
+  
+  // Generate cache key from expert_id, block coordinates, and stage
+  std::string make_key(int64_t expert_id, int64_t nb, const char* stage, int64_t K, int64_t N) {
+    return std::string(stage) + "_e" + std::to_string(expert_id) + 
+           "_nb" + std::to_string(nb) + "_k" + std::to_string(K) + "_n" + std::to_string(N);
+  }
+};
+
+// Thread-local cache to avoid locking in parallel regions
+thread_local WeightCache tls_weight_cache;
+
+// Unpacks VNNI format weights to plain format
+inline void unpack_vnni_weights(
+    int8_t* __restrict__ dst,
+    const int8_t* __restrict__ src,
+    int64_t K,
+    int64_t N) {
+  constexpr int VNNI_BLK = 4;
+  const int64_t K_groups = K / VNNI_BLK;
+  
+#pragma omp parallel for collapse(2) if(K * N > 16384)
+  for (int64_t k_group = 0; k_group < K_groups; ++k_group) {
+    for (int64_t n = 0; n < N; ++n) {
+      for (int64_t d = 0; d < VNNI_BLK; ++d) {
+        int64_t k = k_group * VNNI_BLK + d;
+        dst[k * N + n] = src[k_group * N * VNNI_BLK + n * VNNI_BLK + d];
+      }
+    }
+  }
+}
+
+}  // anonymous namespace
 
 template <typename scalar_t>
 void fused_experts_int8_kernel_impl(
@@ -879,12 +923,12 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_e = 2 * N * packed_K;
   const int64_t stride_n = packed_K;
 
-  // Initialize oneDNN engine
-  engine eng(engine::kind::cpu, 0);
+  // Initialize oneDNN engine (shared across threads)
+  static engine eng(engine::kind::cpu, 0);
 
-  // Stage 1: w1 matmul using parallel_2d (matching baseline structure)
+  // Stage 1: w1 matmul using parallel_2d
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-    // Thread-local resources (same as baseline)
+    // Thread-local resources
     int tid = get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
     int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * BLOCK_N;
@@ -892,14 +936,16 @@ void fused_experts_int8_kernel_impl(
 
     alignas(64) float As[BLOCK_M];
     
-    // Thread-local oneDNN primitives and memory
+    // Thread-local oneDNN stream
     stream s(eng);
     
-    // Buffers for unpacked weights [K, BLOCK_N] in plain format
+    // Thread-local unpacked weight buffer (reused across iterations)
     std::vector<int8_t> B_unpacked(K * BLOCK_N);
+    
+    // Thread-local cache for primitives
+    auto& cache = tls_weight_cache;
 
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-      // nb_upper from top half and nb_lower from bottom half (same as baseline)
       int64_t nb_upper = nb, nb_lower = nb + NB;
       int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
 
@@ -911,11 +957,11 @@ void fused_experts_int8_kernel_impl(
       const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb_upper * BLOCK_N;
       const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb_lower * BLOCK_N;
 
-      // Get compensation from packed buffer (same as baseline)
+      // Get compensation from packed buffer
       const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + BLOCK_N * K);
       const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + BLOCK_N * K);
 
-      // 1.a load A (same as baseline)
+      // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
 
@@ -925,60 +971,89 @@ void fused_experts_int8_kernel_impl(
         As[m] = As_tmp[index];
       }
       
-      // 1.b unpack B0 from VNNI [k/4, BLOCK_N, 4] to plain [K, BLOCK_N]
-      constexpr int VNNI_BLK = 4;
-      for (int64_t k_group = 0; k_group < K / VNNI_BLK; ++k_group) {
-        for (int64_t n = 0; n < BLOCK_N; ++n) {
-          for (int64_t d = 0; d < VNNI_BLK; ++d) {
-            int64_t k = k_group * VNNI_BLK + d;
-            // VNNI layout: B0[k_group * BLOCK_N * 4 + n * 4 + d]
-            B_unpacked[k * BLOCK_N + n] = B0[k_group * BLOCK_N * VNNI_BLK + n * VNNI_BLK + d];
-          }
-        }
+      // Create cache keys (include m_size in key since it affects primitive)
+      std::string key0 = cache.make_key(expert_id, nb_upper, "w1", K, BLOCK_N) + "_m" + std::to_string(m_size);
+      std::string key1 = cache.make_key(expert_id, nb_lower, "w1", K, BLOCK_N) + "_m" + std::to_string(m_size);
+      
+      // 1.b Setup and execute matmul for B0 (use m_size, not BLOCK_M)
+      memory::desc a_md({m_size, K}, memory::data_type::u8, memory::format_tag::ab);
+      memory::desc b_user_md({K, BLOCK_N}, memory::data_type::s8, memory::format_tag::ab);
+      memory::desc b_opt_md({K, BLOCK_N}, memory::data_type::s8, memory::format_tag::any);
+      memory::desc c_md({m_size, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
+      
+      // Check if primitive_desc is cached
+      if (cache.primitive_descs.find(key0) == cache.primitive_descs.end()) {
+        cache.primitive_descs[key0] = matmul::primitive_desc(eng, a_md, b_opt_md, c_md);
+        cache.primitives[key0] = matmul(cache.primitive_descs[key0]);
       }
       
-      // 1.c gemm: C0 = A @ B0 using oneDNN
-      // A: [m_size, K], B: [K, BLOCK_N]
-      auto a_md = memory::desc({m_size, K}, memory::data_type::u8, memory::format_tag::ab);
-      auto b_md = memory::desc({K, BLOCK_N}, memory::data_type::s8, memory::format_tag::ab);
-      auto c_md = memory::desc({m_size, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
+      auto& pd0 = cache.primitive_descs[key0];
+      auto& prim0 = cache.primitives[key0];
+      
+      // Check if weights need reordering
+      memory b0_mem;
+      if (cache.reordered_weights.find(key0) == cache.reordered_weights.end()) {
+        // Unpack VNNI weights
+        unpack_vnni_weights(B_unpacked.data(), B0, K, BLOCK_N);
+        
+        auto b_user_mem = memory(b_user_md, eng, B_unpacked.data());
+        if (pd0.weights_desc() != b_user_md) {
+          cache.reordered_weights[key0] = memory(pd0.weights_desc(), eng);
+          dnnl::reorder(b_user_mem, cache.reordered_weights[key0])
+              .execute(s, b_user_mem, cache.reordered_weights[key0]);
+          s.wait();
+        } else {
+          cache.reordered_weights[key0] = b_user_mem;
+        }
+      }
+      b0_mem = cache.reordered_weights[key0];
       
       auto a_mem = memory(a_md, eng, A);
-      auto b_mem = memory(b_md, eng, B_unpacked.data());
-      auto c_mem = memory(c_md, eng, C0);
+      auto c0_mem = memory(c_md, eng, C0);
       
-      matmul::primitive_desc pd(eng, a_md, b_md, c_md);
-      matmul prim(pd);
-      
-      prim.execute(s, {
+      prim0.execute(s, {
           {DNNL_ARG_SRC, a_mem},
-          {DNNL_ARG_WEIGHTS, b_mem},
-          {DNNL_ARG_DST, c_mem}
+          {DNNL_ARG_WEIGHTS, b0_mem},
+          {DNNL_ARG_DST, c0_mem}
       });
-      s.wait();
-
-      // 1.d unpack B1 from VNNI format
-      for (int64_t k_group = 0; k_group < K / VNNI_BLK; ++k_group) {
-        for (int64_t n = 0; n < BLOCK_N; ++n) {
-          for (int64_t d = 0; d < VNNI_BLK; ++d) {
-            int64_t k = k_group * VNNI_BLK + d;
-            B_unpacked[k * BLOCK_N + n] = B1[k_group * BLOCK_N * VNNI_BLK + n * VNNI_BLK + d];
-          }
-        }
+      
+      // 1.c Setup and execute matmul for B1
+      if (cache.primitive_descs.find(key1) == cache.primitive_descs.end()) {
+        cache.primitive_descs[key1] = matmul::primitive_desc(eng, a_md, b_opt_md, c_md);
+        cache.primitives[key1] = matmul(cache.primitive_descs[key1]);
       }
       
-      // 1.e gemm: C1 = A @ B1 using oneDNN
-      auto c1_mem = memory(c_md, eng, C1);
-      b_mem = memory(b_md, eng, B_unpacked.data());
+      auto& pd1 = cache.primitive_descs[key1];
+      auto& prim1 = cache.primitives[key1];
       
-      prim.execute(s, {
+      memory b1_mem;
+      if (cache.reordered_weights.find(key1) == cache.reordered_weights.end()) {
+        // Unpack VNNI weights
+        unpack_vnni_weights(B_unpacked.data(), B1, K, BLOCK_N);
+        
+        auto b_user_mem = memory(b_user_md, eng, B_unpacked.data());
+        if (pd1.weights_desc() != b_user_md) {
+          cache.reordered_weights[key1] = memory(pd1.weights_desc(), eng);
+          dnnl::reorder(b_user_mem, cache.reordered_weights[key1])
+              .execute(s, b_user_mem, cache.reordered_weights[key1]);
+          s.wait();
+        } else {
+          cache.reordered_weights[key1] = b_user_mem;
+        }
+      }
+      b1_mem = cache.reordered_weights[key1];
+      
+      auto c1_mem = memory(c_md, eng, C1);
+      
+      prim1.execute(s, {
           {DNNL_ARG_SRC, a_mem},
-          {DNNL_ARG_WEIGHTS, b_mem},
+          {DNNL_ARG_WEIGHTS, b1_mem},
           {DNNL_ARG_DST, c1_mem}
       });
+      
       s.wait();
 
-      // 1.f silu and mul (using baseline's optimized SIMD function)
+      // 1.d silu and mul (using baseline's optimized SIMD function)
       const int64_t offset = offsets[mb];
       silu_and_mul<scalar_t, BLOCK_N>(
           ic1 + offset * N + nb * BLOCK_N, C0, C1, As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N);
@@ -1000,9 +1075,9 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_e2 = OC * packed_N;
   const int64_t stride_oc = packed_N;
 
-  // Stage 2: w2 matmul using parallel_2d (matching baseline structure)
+  // Stage 2: w2 matmul using parallel_2d
   parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-    // Thread-local resources (same as baseline)
+    // Thread-local resources
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
@@ -1012,12 +1087,15 @@ void fused_experts_int8_kernel_impl(
     
     // Thread-local unpacked weight buffer
     std::vector<int8_t> B_unpacked(IC * BLOCK_N);
+    
+    // Thread-local cache
+    auto& cache = tls_weight_cache;
 
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
 
-      // A ptr from ic1 of [M * topk, N] in sorted order (same as baseline)
+      // A ptr from ic1 of [M * topk, N] in sorted order
       const uint8_t* __restrict__ A = Aq_tmp + offsets[mb] * N;
       const float* __restrict__ As = As_tmp + offsets[mb];
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -1027,31 +1105,47 @@ void fused_experts_int8_kernel_impl(
       const int8_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
       const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
       
-      // Get compensation from packed buffer (same as baseline)
+      // Get compensation from packed buffer
       const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + BLOCK_N * IC);
 
-      // 2.a unpack B from VNNI format to [IC, BLOCK_N]
-      constexpr int VNNI_BLK = 4;
-      for (int64_t k_group = 0; k_group < IC / VNNI_BLK; ++k_group) {
-        for (int64_t n = 0; n < BLOCK_N; ++n) {
-          for (int64_t d = 0; d < VNNI_BLK; ++d) {
-            int64_t k = k_group * VNNI_BLK + d;
-            B_unpacked[k * BLOCK_N + n] = B[k_group * BLOCK_N * VNNI_BLK + n * VNNI_BLK + d];
-          }
+      // Create cache key (include m_size in key)
+      std::string key = cache.make_key(expert_id, nb, "w2", IC, BLOCK_N) + "_m" + std::to_string(m_size);
+      
+      // Setup memory descriptors (use m_size, not BLOCK_M)
+      memory::desc a_md({m_size, IC}, memory::data_type::u8, memory::format_tag::ab);
+      memory::desc b_user_md({IC, BLOCK_N}, memory::data_type::s8, memory::format_tag::ab);
+      memory::desc b_opt_md({IC, BLOCK_N}, memory::data_type::s8, memory::format_tag::any);
+      memory::desc c_md({m_size, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
+      
+      // Check if primitive_desc is cached
+      if (cache.primitive_descs.find(key) == cache.primitive_descs.end()) {
+        cache.primitive_descs[key] = matmul::primitive_desc(eng, a_md, b_opt_md, c_md);
+        cache.primitives[key] = matmul(cache.primitive_descs[key]);
+      }
+      
+      auto& pd = cache.primitive_descs[key];
+      auto& prim = cache.primitives[key];
+      
+      // Check if weights need reordering
+      memory b_mem;
+      if (cache.reordered_weights.find(key) == cache.reordered_weights.end()) {
+        // Unpack VNNI weights
+        unpack_vnni_weights(B_unpacked.data(), B, IC, BLOCK_N);
+        
+        auto b_user_mem = memory(b_user_md, eng, B_unpacked.data());
+        if (pd.weights_desc() != b_user_md) {
+          cache.reordered_weights[key] = memory(pd.weights_desc(), eng);
+          dnnl::reorder(b_user_mem, cache.reordered_weights[key])
+              .execute(s, b_user_mem, cache.reordered_weights[key]);
+          s.wait();
+        } else {
+          cache.reordered_weights[key] = b_user_mem;
         }
       }
-
-      // 2.b gemm: C = A @ B using oneDNN
-      auto a_md = memory::desc({m_size, IC}, memory::data_type::u8, memory::format_tag::ab);
-      auto b_md = memory::desc({IC, BLOCK_N}, memory::data_type::s8, memory::format_tag::ab);
-      auto c_md = memory::desc({m_size, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
+      b_mem = cache.reordered_weights[key];
       
       auto a_mem = memory(a_md, eng, const_cast<uint8_t*>(A));
-      auto b_mem = memory(b_md, eng, B_unpacked.data());
       auto c_mem = memory(c_md, eng, C32);
-      
-      matmul::primitive_desc pd(eng, a_md, b_md, c_md);
-      matmul prim(pd);
       
       prim.execute(s, {
           {DNNL_ARG_SRC, a_mem},
@@ -1063,7 +1157,7 @@ void fused_experts_int8_kernel_impl(
       // 2.c apply scales using baseline's SIMD function
       scale_C<BLOCK_N>(C, C32, As, Bs, Bcomp, m_size);
 
-      // 2.d copy from C to ic2 in original order and mul topk_weights (same as baseline)
+      // 2.d copy from C to ic2 in original order and mul topk_weights
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m];
         float weight = topk_weights[index];
