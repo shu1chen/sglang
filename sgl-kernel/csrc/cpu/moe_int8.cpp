@@ -231,6 +231,123 @@ inline void scale_C(
 #endif
 }
 
+// Strided version of silu_and_mul: reads C0/C1 from a large [BLOCK_M, ldc] buffer
+// where C0 starts at column offset col0 and C1 at col1, both with stride ldc.
+template <typename scalar_t, int BLOCK_N>
+inline void silu_and_mul_strided(
+    scalar_t* __restrict__ C,
+    const int32_t* __restrict__ C_full,  // full [BLOCK_M, ldc] buffer
+    int64_t col0,                        // column offset for gate (C0)
+    int64_t col1,                        // column offset for up (C1)
+    int64_t ldc,                         // leading dimension (total columns)
+    const float* __restrict__ As,
+    const float* __restrict__ Bs0,
+    const float* __restrict__ Bs1,
+    const int32_t* __restrict__ Bcomp0,
+    const int32_t* __restrict__ Bcomp1,
+    int64_t m_size,
+    int64_t N) {
+#if defined(CPU_CAPABILITY_AVX512)
+  constexpr int COLS = BLOCK_N / 16;
+  static_assert(COLS % 2 == 0);
+
+  __m512 vc0[COLS];
+  __m512 vc1[COLS];
+  __m512i vcomp0[COLS];
+  __m512i vcomp1[COLS];
+  __m512 vas;
+  __m512 vbs0[COLS];
+  __m512 vbs1[COLS];
+
+  auto load_scale_and_comp = [&](auto col) {
+    vcomp0[col] = _mm512_loadu_si512(Bcomp0 + col * 16);
+    vcomp1[col] = _mm512_loadu_si512(Bcomp1 + col * 16);
+    vbs0[col] = _mm512_loadu_ps(Bs0 + col * 16);
+    vbs1[col] = _mm512_loadu_ps(Bs1 + col * 16);
+  };
+  Unroll<COLS>{}(load_scale_and_comp);
+
+  auto scalec = [&](auto col, int64_t m) {
+    vas = _mm512_set1_ps(As[m]);
+    __m512i vc32_0 = _mm512_loadu_si512(C_full + m * ldc + col0 + col * 16);
+    __m512i vc32_1 = _mm512_loadu_si512(C_full + m * ldc + col1 + col * 16);
+    vc0[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32_0, vcomp0[col]));
+    vc1[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32_1, vcomp1[col]));
+    vc0[col] = _mm512_mul_ps(_mm512_mul_ps(vc0[col], vas), vbs0[col]);
+    vc1[col] = _mm512_mul_ps(_mm512_mul_ps(vc1[col], vas), vbs1[col]);
+  };
+
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  const fVec one = fVec(1.f);
+  auto silu_and_mul_op = [&](auto col) {
+    fVec x = fVec(vc0[col]);
+    fVec y = fVec(vc1[col]);
+    x = x / (one + x.neg().exp_u20());
+    vc0[col] = x * y;
+  };
+
+  auto storec = [&](auto col, int64_t m) {
+    if constexpr (col % 2 == 0) {
+      fVec x0 = fVec(vc0[col + 0]);
+      fVec x1 = fVec(vc0[col + 1]);
+      bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+      out_vec.store(C + m * N + col * 16);
+    }
+  };
+
+  for (int64_t m = 0; m < m_size; ++m) {
+    Unroll<COLS>{}(scalec, m);
+    Unroll<COLS>{}(silu_and_mul_op);
+    Unroll<COLS>{}(storec, m);
+  }
+#else
+  TORCH_CHECK(false, "silu_and_mul_strided: scalar path not implemented!");
+#endif
+}
+
+// Strided version of scale_C: reads from a large [BLOCK_M, ldc] buffer at column offset col_off
+template <int BLOCK_N>
+inline void scale_C_strided(
+    float* __restrict__ C,
+    const int32_t* __restrict__ C_full,  // full [BLOCK_M, ldc] buffer
+    int64_t col_off,                     // column offset
+    int64_t ldc,                         // leading dimension
+    const float* __restrict__ As,
+    const float* __restrict__ Bs,
+    const int32_t* __restrict__ Bcomp,
+    int64_t m_size) {
+#if defined(CPU_CAPABILITY_AVX512)
+  constexpr int COLS = BLOCK_N / 16;
+  static_assert(COLS % 2 == 0);
+
+  __m512 vc[COLS];
+  __m512i vcomp[COLS];
+  __m512 vas;
+  __m512 vbs[COLS];
+
+  auto load_scale_and_comp = [&](auto col) {
+    vcomp[col] = _mm512_loadu_si512(Bcomp + col * 16);
+    vbs[col] = _mm512_loadu_ps(Bs + col * 16);
+  };
+  Unroll<COLS>{}(load_scale_and_comp);
+
+  auto scalec = [&](auto col, int64_t m) {
+    vas = _mm512_set1_ps(As[m]);
+    __m512i vc32 = _mm512_loadu_si512(C_full + m * ldc + col_off + col * 16);
+    vc[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32, vcomp[col]));
+    vc[col] = _mm512_mul_ps(_mm512_mul_ps(vc[col], vas), vbs[col]);
+    _mm512_storeu_ps(C + m * BLOCK_N + col * 16, vc[col]);
+  };
+
+  for (int64_t m = 0; m < m_size; ++m) {
+    Unroll<COLS>{}(scalec, m);
+  }
+#else
+  TORCH_CHECK(false, "scale_C_strided: scalar path not implemented!");
+#endif
+}
+
 /// gemm for w13
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_vnni {
@@ -894,8 +1011,8 @@ inline const OneDNNWeightCache::CacheEntry* get_or_create_cached_weight(
 ) {
   auto& cache = OneDNNWeightCache::instance();
 
+  // Lock-free fast path
   {
-    std::lock_guard<std::mutex> lock(cache.mutex);
     auto it = cache.entries.find(weight_ptr);
     if (it != cache.entries.end()) {
       return &it->second;
@@ -910,8 +1027,6 @@ inline const OneDNNWeightCache::CacheEntry* get_or_create_cached_weight(
   dnnl::memory::desc b_opt_md({K_dim, N_dim}, dnnl::memory::data_type::s8, dnnl::memory::format_tag::any);
   dnnl::memory::desc c_md({BLOCK_M_dim, N_dim}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::ab);
 
-  // Use user-managed scratchpad so the same primitive can be executed
-  // concurrently from multiple threads, each with its own scratchpad buffer.
   dnnl::primitive_attr attr;
   attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
@@ -938,99 +1053,6 @@ inline const OneDNNWeightCache::CacheEntry* get_or_create_cached_weight(
   auto [it, inserted] = cache.entries.emplace(
       weight_ptr,
       OneDNNWeightCache::CacheEntry{std::move(b_reordered), std::move(pd), std::move(prim), std::move(sp_md)});
-  return &it->second;
-}
-
-// ---- Paired weight cache: combines gate+up blocks [K, 2*BLOCK_N] ----
-// Keyed by the gate block pointer (B0). Stores combined weight and a single
-// matmul primitive producing [BLOCK_M, 2*BLOCK_N] output.
-struct OneDNNPairedCache {
-  struct PairedEntry {
-    dnnl::memory reordered_weight;
-    dnnl::matmul::primitive_desc prim_desc;
-    dnnl::matmul primitive;
-    dnnl::memory::desc scratchpad_md;
-  };
-
-  std::unordered_map<const void*, PairedEntry> entries;
-  std::mutex mutex;
-
-  static OneDNNPairedCache& instance() {
-    static OneDNNPairedCache cache;
-    return cache;
-  }
-
-  const PairedEntry* find_lockfree(const void* key) const {
-    auto it = entries.find(key);
-    return (it != entries.end()) ? &it->second : nullptr;
-  }
-};
-
-// Create a paired weight [K, 2*BLOCK_N] by unpacking and concatenating
-// two VNNI blocks (gate B0 and up B1) side by side.
-inline const OneDNNPairedCache::PairedEntry* get_or_create_paired_weight(
-    const int8_t* key_ptr,   // B0 pointer used as cache key
-    const int8_t* B0_vnni,   // gate block in VNNI format [K, BLOCK_N]
-    const int8_t* B1_vnni,   // up block in VNNI format [K, BLOCK_N]
-    int64_t K_dim,
-    int64_t BLOCK_N_dim,
-    int64_t BLOCK_M_dim
-) {
-  auto& cache = OneDNNPairedCache::instance();
-
-  {
-    std::lock_guard<std::mutex> lock(cache.mutex);
-    auto it = cache.entries.find(key_ptr);
-    if (it != cache.entries.end()) {
-      return &it->second;
-    }
-  }
-
-  auto& eng = get_onednn_engine();
-  dnnl::stream s(eng);
-
-  const int64_t N2 = 2 * BLOCK_N_dim;
-
-  dnnl::memory::desc a_md({BLOCK_M_dim, K_dim}, dnnl::memory::data_type::u8, dnnl::memory::format_tag::ab);
-  dnnl::memory::desc b_user_md({K_dim, N2}, dnnl::memory::data_type::s8, dnnl::memory::format_tag::ab);
-  dnnl::memory::desc b_opt_md({K_dim, N2}, dnnl::memory::data_type::s8, dnnl::memory::format_tag::any);
-  dnnl::memory::desc c_md({BLOCK_M_dim, N2}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::ab);
-
-  dnnl::primitive_attr attr;
-  attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-
-  auto pd = dnnl::matmul::primitive_desc(eng, a_md, b_opt_md, c_md, attr);
-  auto prim = dnnl::matmul(pd);
-  auto sp_md = pd.scratchpad_desc();
-
-  // Unpack both VNNI blocks and concatenate into [K, 2*BLOCK_N]
-  std::vector<int8_t> unpacked_b0(K_dim * BLOCK_N_dim);
-  std::vector<int8_t> unpacked_b1(K_dim * BLOCK_N_dim);
-  unpack_vnni_weights(unpacked_b0.data(), B0_vnni, K_dim, BLOCK_N_dim);
-  unpack_vnni_weights(unpacked_b1.data(), B1_vnni, K_dim, BLOCK_N_dim);
-
-  // Combined: [K, 2*BLOCK_N] row-major: for each k row, first BLOCK_N from B0, next BLOCK_N from B1
-  std::vector<int8_t> combined(K_dim * N2);
-  for (int64_t k = 0; k < K_dim; ++k) {
-    std::memcpy(combined.data() + k * N2, unpacked_b0.data() + k * BLOCK_N_dim, BLOCK_N_dim);
-    std::memcpy(combined.data() + k * N2 + BLOCK_N_dim, unpacked_b1.data() + k * BLOCK_N_dim, BLOCK_N_dim);
-  }
-
-  auto b_user_mem = dnnl::memory(b_user_md, eng, combined.data());
-  dnnl::memory b_reordered;
-  if (pd.weights_desc() != b_user_md) {
-    b_reordered = dnnl::memory(pd.weights_desc(), eng);
-    dnnl::reorder(b_user_mem, b_reordered).execute(s, b_user_mem, b_reordered);
-    s.wait();
-  } else {
-    b_reordered = dnnl::memory(b_user_md, eng);
-    std::memcpy(b_reordered.get_data_handle(), combined.data(), K_dim * N2);
-  }
-
-  std::lock_guard<std::mutex> lock(cache.mutex);
-  auto [it, inserted] = cache.entries.emplace(
-      key_ptr,
-      OneDNNPairedCache::PairedEntry{std::move(b_reordered), std::move(pd), std::move(prim), std::move(sp_md)});
   return &it->second;
 }
 
@@ -1085,75 +1107,69 @@ void fused_experts_int8_kernel_impl(
 
   auto& eng = get_onednn_engine();
 
-  // Pre-reorder paired w1 weight blocks: combine gate + up into [K, 2*BLOCK_N]
+  // Pre-reorder all w1 weight blocks (first call only; cached thereafter)
   {
     const int8_t* w1_base = packed_w1;  // strip __restrict__
-    // Build list of (key, B0, B1) triples for parallel pre-reorder
-    struct PairInfo { const int8_t* key; const int8_t* b0; const int8_t* b1; };
-    std::vector<PairInfo> pairs;
-    pairs.reserve(E * NB);
+    std::vector<const int8_t*> w1_ptrs;
+    w1_ptrs.reserve(E * 2 * NB);
     for (int64_t e = 0; e < E; ++e) {
       for (int64_t nb = 0; nb < NB; ++nb) {
-        const int8_t* b0 = w1_base + e * stride_e + nb * BLOCK_N * stride_n;
-        const int8_t* b1 = w1_base + e * stride_e + (NB + nb) * BLOCK_N * stride_n;
-        pairs.push_back({b0, b0, b1});
+        w1_ptrs.push_back(w1_base + e * stride_e + nb * BLOCK_N * stride_n);
+        w1_ptrs.push_back(w1_base + e * stride_e + (NB + nb) * BLOCK_N * stride_n);
       }
     }
-    at::parallel_for(0, (int64_t)pairs.size(), 0, [&](int64_t begin, int64_t end) {
+    at::parallel_for(0, (int64_t)w1_ptrs.size(), 0, [&](int64_t begin, int64_t end) {
       for (int64_t i = begin; i < end; ++i) {
-        get_or_create_paired_weight(pairs[i].key, pairs[i].b0, pairs[i].b1, K, BLOCK_N, BLOCK_M);
+        get_or_create_cached_weight(w1_ptrs[i], K, BLOCK_N, BLOCK_M);
       }
     });
   }
 
   // Stage 1: w1 matmul using parallel_2d + loop_2d
-  // Each iteration does ONE matmul [BLOCK_M, K] × [K, 2*BLOCK_N] → [BLOCK_M, 2*BLOCK_N]
-  // then splits into C0, C1 for silu_and_mul
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
     int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
-    // Combined output buffer [BLOCK_M, 2*BLOCK_N] — allocate on stack for BLOCK_N=32
-    alignas(64) int32_t C_combined[BLOCK_M * 2 * BLOCK_N];
     alignas(64) float As[BLOCK_M];
 
+    // Thread-local oneDNN stream & memory objects (created once per thread)
     stream s(eng);
-
     memory::desc a_md({BLOCK_M, K}, memory::data_type::u8, memory::format_tag::ab);
-    memory::desc c_paired_md({BLOCK_M, (int64_t)(2 * BLOCK_N)}, memory::data_type::s32, memory::format_tag::ab);
-
+    memory::desc c_md({BLOCK_M, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
     auto a_mem = memory(a_md, eng, A);
-    auto c_paired_mem = memory(c_paired_md, eng, C_combined);
+    auto c0_mem = memory(c_md, eng, C0);
+    auto c1_mem = memory(c_md, eng, C1);
 
     // Per-thread scratchpad
     dnnl::memory scratchpad_mem;
     {
-      auto& pcache = OneDNNPairedCache::instance();
-      auto* sample = pcache.find_lockfree(packed_w1);
+      auto& wcache = OneDNNWeightCache::instance();
+      auto* sample = wcache.find_lockfree(packed_w1);
       if (sample && sample->scratchpad_md.get_size() > 0) {
         scratchpad_mem = memory(sample->scratchpad_md, eng);
       }
     }
 
-    std::unordered_map<int, memory> args = {
-        {DNNL_ARG_SRC, a_mem},
-        {DNNL_ARG_WEIGHTS, a_mem},
-        {DNNL_ARG_DST, c_paired_mem},
-        {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
+    std::unordered_map<int, memory> args0 = {
+        {DNNL_ARG_SRC, a_mem}, {DNNL_ARG_WEIGHTS, a_mem},
+        {DNNL_ARG_DST, c0_mem}, {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
+    };
+    std::unordered_map<int, memory> args1 = {
+        {DNNL_ARG_SRC, a_mem}, {DNNL_ARG_WEIGHTS, a_mem},
+        {DNNL_ARG_DST, c1_mem}, {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
     };
 
-    auto& pcache = OneDNNPairedCache::instance();
+    auto& wcache = OneDNNWeightCache::instance();
 
-    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t) {
       int32_t expert_id = expert_ids[mb];
 
       const int8_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
       const int8_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + (NB + nb) * BLOCK_N * stride_n;
       const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb * BLOCK_N;
-      const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + (NB + nb) * BLOCK_N;
-
+      const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + N + nb * BLOCK_N;
       const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + BLOCK_N * K);
       const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + BLOCK_N * K);
 
@@ -1169,17 +1185,15 @@ void fused_experts_int8_kernel_impl(
         As[m] = As_tmp[index];
       }
 
-      // Single matmul: C_combined[BLOCK_M, 2*BLOCK_N] = A @ [B0|B1]
-      auto* entry = pcache.find_lockfree(B0);
-      args[DNNL_ARG_WEIGHTS] = entry->reordered_weight;
-      entry->primitive.execute(s, args);
-      s.wait();
+      auto* entry0 = wcache.find_lockfree(B0);
+      auto* entry1 = wcache.find_lockfree(B1);
 
-      // Split C_combined [BLOCK_M, 2*BLOCK_N] into C0 [BLOCK_M, BLOCK_N] and C1 [BLOCK_M, BLOCK_N]
-      for (int64_t m = 0; m < m_size; ++m) {
-        std::memcpy(C0 + m * BLOCK_N, C_combined + m * 2 * BLOCK_N, BLOCK_N * sizeof(int32_t));
-        std::memcpy(C1 + m * BLOCK_N, C_combined + m * 2 * BLOCK_N + BLOCK_N, BLOCK_N * sizeof(int32_t));
-      }
+      args0[DNNL_ARG_WEIGHTS] = entry0->reordered_weight;
+      args1[DNNL_ARG_WEIGHTS] = entry1->reordered_weight;
+
+      entry0->primitive.execute(s, args0);
+      entry1->primitive.execute(s, args1);
+      s.wait();
 
       const int64_t offset = offsets[mb];
       silu_and_mul<scalar_t, BLOCK_N>(
@@ -1197,7 +1211,6 @@ void fused_experts_int8_kernel_impl(
   // Stage 2: intermediate_cache2 = intermediate_cache1 @ w2
   const int64_t OC = K;
   const int64_t IC = N;
-  const int64_t MB2 = MB;
   const int64_t NB2 = div_up(OC, BLOCK_N);
   const int64_t stride_e2 = OC * packed_N;
   const int64_t stride_oc = packed_N;
@@ -1220,7 +1233,7 @@ void fused_experts_int8_kernel_impl(
   }
 
   // Stage 2: w2 matmul using parallel_2d + loop_2d
-  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+  parallel_2d(MB, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
@@ -1233,10 +1246,8 @@ void fused_experts_int8_kernel_impl(
     }
 
     stream s(eng);
-
     memory::desc a_md({BLOCK_M, IC}, memory::data_type::u8, memory::format_tag::ab);
     memory::desc c_md({BLOCK_M, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
-
     auto a_mem = memory(a_md, eng, A_pad);
     auto c_mem = memory(c_md, eng, C32);
 
@@ -1250,15 +1261,13 @@ void fused_experts_int8_kernel_impl(
     }
 
     std::unordered_map<int, memory> args = {
-        {DNNL_ARG_SRC, a_mem},
-        {DNNL_ARG_WEIGHTS, a_mem},
-        {DNNL_ARG_DST, c_mem},
-        {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
+        {DNNL_ARG_SRC, a_mem}, {DNNL_ARG_WEIGHTS, a_mem},
+        {DNNL_ARG_DST, c_mem}, {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
     };
 
     auto& wcache = OneDNNWeightCache::instance();
 
-    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
 
