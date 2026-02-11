@@ -982,9 +982,11 @@ inline void unpack_vnni_weights(
 // ---- Global weight cache keyed by source pointer ----
 struct OneDNNWeightCache {
   struct CacheEntry {
-    dnnl::memory reordered_weight;
+    dnnl::memory reordered_weight;   // owns the memory (shared_ptr lifetime)
+    dnnl_memory_t raw_weight;        // raw handle for fast C API execute
+    dnnl_primitive_t raw_primitive;   // raw handle for fast C API execute
     dnnl::matmul::primitive_desc prim_desc;
-    dnnl::matmul primitive;
+    dnnl::matmul primitive;          // owns the primitive (shared_ptr lifetime)
     dnnl::memory::desc scratchpad_md;
   };
 
@@ -1049,10 +1051,16 @@ inline const OneDNNWeightCache::CacheEntry* get_or_create_cached_weight(
     std::memcpy(b_reordered.get_data_handle(), unpacked.data(), K_dim * N_dim);
   }
 
+  // Capture raw handles before moving
+  dnnl_memory_t raw_w = b_reordered.get();
+  dnnl_primitive_t raw_p = prim.get();
+
   std::lock_guard<std::mutex> lock(cache.mutex);
   auto [it, inserted] = cache.entries.emplace(
       weight_ptr,
-      OneDNNWeightCache::CacheEntry{std::move(b_reordered), std::move(pd), std::move(prim), std::move(sp_md)});
+      OneDNNWeightCache::CacheEntry{
+          std::move(b_reordered), raw_w, raw_p,
+          std::move(pd), std::move(prim), std::move(sp_md)});
   return &it->second;
 }
 
@@ -1108,24 +1116,27 @@ void fused_experts_int8_kernel_impl(
   auto& eng = get_onednn_engine();
 
   // Pre-reorder all w1 weight blocks (first call only; cached thereafter)
+  // Build flat lookup tables for O(1) access in the hot loop.
+  // w1_entries[e * 2*NB + nb]        = gate block for expert e, nb
+  // w1_entries[e * 2*NB + NB + nb]   = up block for expert e, nb
+  const int64_t w1_entries_size = E * 2 * NB;
+  std::vector<const OneDNNWeightCache::CacheEntry*> w1_entries(w1_entries_size);
   {
-    const int8_t* w1_base = packed_w1;  // strip __restrict__
-    std::vector<const int8_t*> w1_ptrs;
-    w1_ptrs.reserve(E * 2 * NB);
+    const int8_t* w1_base = packed_w1;
+    auto& wcache = OneDNNWeightCache::instance();
     for (int64_t e = 0; e < E; ++e) {
       for (int64_t nb = 0; nb < NB; ++nb) {
-        w1_ptrs.push_back(w1_base + e * stride_e + nb * BLOCK_N * stride_n);
-        w1_ptrs.push_back(w1_base + e * stride_e + (NB + nb) * BLOCK_N * stride_n);
+        const int8_t* p0 = w1_base + e * stride_e + nb * BLOCK_N * stride_n;
+        const int8_t* p1 = w1_base + e * stride_e + (NB + nb) * BLOCK_N * stride_n;
+        w1_entries[e * 2 * NB + nb] = get_or_create_cached_weight(p0, K, BLOCK_N, BLOCK_M);
+        w1_entries[e * 2 * NB + NB + nb] = get_or_create_cached_weight(p1, K, BLOCK_N, BLOCK_M);
       }
     }
-    at::parallel_for(0, (int64_t)w1_ptrs.size(), 0, [&](int64_t begin, int64_t end) {
-      for (int64_t i = begin; i < end; ++i) {
-        get_or_create_cached_weight(w1_ptrs[i], K, BLOCK_N, BLOCK_M);
-      }
-    });
   }
 
   // Stage 1: w1 matmul using parallel_2d + loop_2d
+  // Uses C API dnnl_primitive_execute with stack-allocated args to avoid
+  // unordered_map overhead and shared_ptr copies per iteration.
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
@@ -1145,24 +1156,21 @@ void fused_experts_int8_kernel_impl(
     // Per-thread scratchpad
     dnnl::memory scratchpad_mem;
     {
-      auto& wcache = OneDNNWeightCache::instance();
-      auto* sample = wcache.find_lockfree(packed_w1);
+      auto* sample = w1_entries[0];
       if (sample && sample->scratchpad_md.get_size() > 0) {
         scratchpad_mem = memory(sample->scratchpad_md, eng);
       }
     }
 
-    std::unordered_map<int, memory> args0 = {
-        {DNNL_ARG_SRC, a_mem}, {DNNL_ARG_WEIGHTS, a_mem},
-        {DNNL_ARG_DST, c0_mem}, {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
-    };
-    std::unordered_map<int, memory> args1 = {
-        {DNNL_ARG_SRC, a_mem}, {DNNL_ARG_WEIGHTS, a_mem},
-        {DNNL_ARG_DST, c1_mem}, {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
-    };
+    // Cache raw handles for C API execution (avoid shared_ptr overhead)
+    dnnl_memory_t raw_a = a_mem.get();
+    dnnl_memory_t raw_c0 = c0_mem.get();
+    dnnl_memory_t raw_c1 = c1_mem.get();
+    dnnl_memory_t raw_sp = scratchpad_mem.get(true);  // allow_empty=true
+    dnnl_stream_t raw_s = s.get();
 
-    auto& wcache = OneDNNWeightCache::instance();
-
+    int64_t last_mb = -1;
+    int64_t cur_m_size = 0;
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t) {
       int32_t expert_id = expert_ids[mb];
 
@@ -1173,31 +1181,45 @@ void fused_experts_int8_kernel_impl(
       const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + BLOCK_N * K);
       const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + BLOCK_N * K);
 
-      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
-      int64_t m_size = offsets[mb + 1] - offsets[mb];
+      if (mb != last_mb) {
+        last_mb = mb;
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        cur_m_size = offsets[mb + 1] - offsets[mb];
 
-      if (m_size < BLOCK_M) {
-        std::memset(A + m_size * K, 0, (BLOCK_M - m_size) * K);
+        if (cur_m_size < BLOCK_M) {
+          std::memset(A + cur_m_size * K, 0, (BLOCK_M - cur_m_size) * K);
+        }
+        for (int64_t m = 0; m < cur_m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, Aq_tmp + index * K, K);
+          As[m] = As_tmp[index];
+        }
+        dnnl_memory_set_data_handle(raw_a, A);
       }
-      for (int64_t m = 0; m < m_size; ++m) {
-        int32_t index = A_ids[m] / topk;
-        copy_stub(A + m * K, Aq_tmp + index * K, K);
-        As[m] = As_tmp[index];
-      }
 
-      auto* entry0 = wcache.find_lockfree(B0);
-      auto* entry1 = wcache.find_lockfree(B1);
+      auto* entry0 = w1_entries[expert_id * 2 * NB + nb];
+      auto* entry1 = w1_entries[expert_id * 2 * NB + NB + nb];
 
-      args0[DNNL_ARG_WEIGHTS] = entry0->reordered_weight;
-      args1[DNNL_ARG_WEIGHTS] = entry1->reordered_weight;
+      // C API execute: stack-allocated args, no hash map, no shared_ptr copies
+      dnnl_exec_arg_t exec_args0[] = {
+          {DNNL_ARG_SRC, raw_a},
+          {DNNL_ARG_WEIGHTS, entry0->raw_weight},
+          {DNNL_ARG_DST, raw_c0},
+          {DNNL_ARG_SCRATCHPAD, raw_sp}
+      };
+      dnnl_exec_arg_t exec_args1[] = {
+          {DNNL_ARG_SRC, raw_a},
+          {DNNL_ARG_WEIGHTS, entry1->raw_weight},
+          {DNNL_ARG_DST, raw_c1},
+          {DNNL_ARG_SCRATCHPAD, raw_sp}
+      };
 
-      entry0->primitive.execute(s, args0);
-      entry1->primitive.execute(s, args1);
-      s.wait();
+      dnnl_primitive_execute(entry0->raw_primitive, raw_s, 4, exec_args0);
+      dnnl_primitive_execute(entry1->raw_primitive, raw_s, 4, exec_args1);
 
       const int64_t offset = offsets[mb];
       silu_and_mul<scalar_t, BLOCK_N>(
-          ic1 + offset * N + nb * BLOCK_N, C0, C1, As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N);
+          ic1 + offset * N + nb * BLOCK_N, C0, C1, As, Bs0, Bs1, Bcomp0, Bcomp1, cur_m_size, N);
     });
   });
 
@@ -1215,24 +1237,21 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_e2 = OC * packed_N;
   const int64_t stride_oc = packed_N;
 
-  // Pre-reorder all w2 weight blocks
+  // Pre-reorder all w2 weight blocks + build flat lookup table
+  // w2_entries[e * NB2 + nb] = entry for expert e, output block nb
+  const int64_t w2_entries_size = E * NB2;
+  std::vector<const OneDNNWeightCache::CacheEntry*> w2_entries(w2_entries_size);
   {
-    const int8_t* w2_base = packed_w2;  // strip __restrict__
-    std::vector<const int8_t*> w2_ptrs;
-    w2_ptrs.reserve(E * NB2);
+    const int8_t* w2_base = packed_w2;
     for (int64_t e = 0; e < E; ++e) {
       for (int64_t nb = 0; nb < NB2; ++nb) {
-        w2_ptrs.push_back(w2_base + e * stride_e2 + nb * BLOCK_N * stride_oc);
+        const int8_t* p = w2_base + e * stride_e2 + nb * BLOCK_N * stride_oc;
+        w2_entries[e * NB2 + nb] = get_or_create_cached_weight(p, IC, BLOCK_N, BLOCK_M);
       }
     }
-    at::parallel_for(0, (int64_t)w2_ptrs.size(), 0, [&](int64_t begin, int64_t end) {
-      for (int64_t i = begin; i < end; ++i) {
-        get_or_create_cached_weight(w2_ptrs[i], IC, BLOCK_N, BLOCK_M);
-      }
-    });
   }
 
-  // Stage 2: w2 matmul using parallel_2d + loop_2d
+  // Stage 2: w2 matmul using parallel_2d + loop_2d (C API execution)
   parallel_2d(MB, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
@@ -1253,19 +1272,19 @@ void fused_experts_int8_kernel_impl(
 
     dnnl::memory scratchpad_mem;
     {
-      auto& wcache = OneDNNWeightCache::instance();
-      auto* sample = wcache.find_lockfree(packed_w2);
+      auto* sample = w2_entries[0];
       if (sample && sample->scratchpad_md.get_size() > 0) {
         scratchpad_mem = memory(sample->scratchpad_md, eng);
       }
     }
 
-    std::unordered_map<int, memory> args = {
-        {DNNL_ARG_SRC, a_mem}, {DNNL_ARG_WEIGHTS, a_mem},
-        {DNNL_ARG_DST, c_mem}, {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
-    };
+    // Cache raw handles for C API execution
+    dnnl_memory_t raw_a = a_mem.get();
+    dnnl_memory_t raw_c = c_mem.get();
+    dnnl_memory_t raw_sp = scratchpad_mem.get(true);
+    dnnl_stream_t raw_s = s.get();
 
-    auto& wcache = OneDNNWeightCache::instance();
+    int64_t last_mb = -1;  // track last mb to skip redundant A setup
 
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
@@ -1280,22 +1299,29 @@ void fused_experts_int8_kernel_impl(
       const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
       const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + BLOCK_N * IC);
 
-      auto* entry = wcache.find_lockfree(B);
+      auto* entry = w2_entries[expert_id * NB2 + nb];
 
-      const uint8_t* A_ptr;
-      if (m_size < BLOCK_M) {
-        std::memcpy(A_pad, A_orig, m_size * IC);
-        std::memset(A_pad + m_size * IC, 0, (BLOCK_M - m_size) * IC);
-        A_ptr = A_pad;
-      } else {
-        A_ptr = A_orig;
+      if (mb != last_mb) {
+        last_mb = mb;
+        const uint8_t* A_ptr;
+        if (m_size < BLOCK_M) {
+          std::memcpy(A_pad, A_orig, m_size * IC);
+          std::memset(A_pad + m_size * IC, 0, (BLOCK_M - m_size) * IC);
+          A_ptr = A_pad;
+        } else {
+          A_ptr = A_orig;
+        }
+        dnnl_memory_set_data_handle(raw_a, const_cast<uint8_t*>(A_ptr));
       }
 
-      a_mem.set_data_handle(const_cast<uint8_t*>(A_ptr));
-      args[DNNL_ARG_WEIGHTS] = entry->reordered_weight;
+      dnnl_exec_arg_t exec_args[] = {
+          {DNNL_ARG_SRC, raw_a},
+          {DNNL_ARG_WEIGHTS, entry->raw_weight},
+          {DNNL_ARG_DST, raw_c},
+          {DNNL_ARG_SCRATCHPAD, raw_sp}
+      };
 
-      entry->primitive.execute(s, args);
-      s.wait();
+      dnnl_primitive_execute(entry->raw_primitive, raw_s, 4, exec_args);
 
       scale_C<BLOCK_N>(C, C32, As, Bs, Bcomp, m_size);
 
