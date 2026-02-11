@@ -832,38 +832,25 @@ void fused_experts_int8_kernel_impl(
 #elif SGLANG_USE_ONEDNN_MOE == 1
 // ============================================================================
 // Optimized oneDNN-based implementation
-// Uses oneDNN matmul with format_tag::any and cached weight reordering
+// Uses oneDNN matmul with pre-reordered weights and minimal overhead
 // ============================================================================
 
 namespace {
 
-// Cache structure for reordered weights and primitives
-struct WeightCache {
-  std::unordered_map<std::string, dnnl::memory> reordered_weights;
-  std::unordered_map<std::string, dnnl::matmul::primitive_desc> primitive_descs;
-  std::unordered_map<std::string, dnnl::matmul> primitives;
-  std::mutex mutex;
-  
-  // Generate cache key from expert_id, block coordinates, and stage
-  std::string make_key(int64_t expert_id, int64_t nb, const char* stage, int64_t K, int64_t N) {
-    return std::string(stage) + "_e" + std::to_string(expert_id) + 
-           "_nb" + std::to_string(nb) + "_k" + std::to_string(K) + "_n" + std::to_string(N);
-  }
-};
+// Global oneDNN engine - shared by all threads
+inline dnnl::engine& get_onednn_engine() {
+  static dnnl::engine eng(dnnl::engine::kind::cpu, 0);
+  return eng;
+}
 
-// Thread-local cache to avoid locking in parallel regions
-thread_local WeightCache tls_weight_cache;
-
-// Unpacks VNNI format weights to plain format
-inline void unpack_vnni_weights(
+// Unpacks VNNI format weights to plain [K, N] format (no OMP inside - caller handles threading)
+inline void unpack_vnni_weights_single(
     int8_t* __restrict__ dst,
     const int8_t* __restrict__ src,
     int64_t K,
     int64_t N) {
   constexpr int VNNI_BLK = 4;
   const int64_t K_groups = K / VNNI_BLK;
-  
-#pragma omp parallel for collapse(2) if(K * N > 16384)
   for (int64_t k_group = 0; k_group < K_groups; ++k_group) {
     for (int64_t n = 0; n < N; ++n) {
       for (int64_t d = 0; d < VNNI_BLK; ++d) {
@@ -872,6 +859,95 @@ inline void unpack_vnni_weights(
       }
     }
   }
+}
+
+// ---- Global weight cache keyed by source pointer ----
+// The packed weight pointer uniquely identifies each (expert, block) combination
+// because it's computed as: packed_w + expert_id * stride + nb * BLOCK_N * stride_n
+// This is stable across calls as long as the weight tensor doesn't move.
+struct OneDNNWeightCache {
+  struct CacheEntry {
+    dnnl::memory reordered_weight;
+    dnnl::matmul::primitive_desc prim_desc;
+    dnnl::matmul primitive;
+    dnnl::memory::desc scratchpad_md;  // for user-managed scratchpad
+  };
+
+  std::unordered_map<const void*, CacheEntry> entries;
+  std::mutex mutex;
+
+  static OneDNNWeightCache& instance() {
+    static OneDNNWeightCache cache;
+    return cache;
+  }
+
+  // Lock-free lookup - safe when no concurrent writes
+  const CacheEntry* find_lockfree(const void* key) const {
+    auto it = entries.find(key);
+    return (it != entries.end()) ? &it->second : nullptr;
+  }
+};
+
+// Pre-reorder a weight block and cache it. Thread-safe.
+// Returns a pointer to the cached entry.
+inline const OneDNNWeightCache::CacheEntry* get_or_create_cached_weight(
+    const int8_t* weight_ptr,
+    int64_t K_dim,      // rows of weight (K for w1, IC for w2)
+    int64_t N_dim,      // cols of weight (BLOCK_N)
+    int64_t BLOCK_M_dim // M dimension for primitive
+) {
+  auto& cache = OneDNNWeightCache::instance();
+
+  // Check with lock first
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto it = cache.entries.find(weight_ptr);
+    if (it != cache.entries.end()) {
+      return &it->second;
+    }
+  }
+
+  // Slow path: create entry
+  auto& eng = get_onednn_engine();
+  dnnl::stream s(eng);
+
+  // Create memory descriptors - use BLOCK_M for the primitive
+  dnnl::memory::desc a_md({BLOCK_M_dim, K_dim}, dnnl::memory::data_type::u8, dnnl::memory::format_tag::ab);
+  dnnl::memory::desc b_user_md({K_dim, N_dim}, dnnl::memory::data_type::s8, dnnl::memory::format_tag::ab);
+  dnnl::memory::desc b_opt_md({K_dim, N_dim}, dnnl::memory::data_type::s8, dnnl::memory::format_tag::any);
+  dnnl::memory::desc c_md({BLOCK_M_dim, N_dim}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::ab);
+
+  // Use scratchpad_mode::user so the same primitive can be safely executed
+  // from multiple threads concurrently (each with its own scratchpad buffer)
+  dnnl::primitive_attr attr;
+  attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+
+  auto pd = dnnl::matmul::primitive_desc(eng, a_md, b_opt_md, c_md, attr);
+  auto prim = dnnl::matmul(pd);
+  auto scratchpad_md = pd.scratchpad_desc();
+
+  // Unpack VNNI weights to plain format [K, N]
+  std::vector<int8_t> unpacked(K_dim * N_dim);
+  unpack_vnni_weights_single(unpacked.data(), weight_ptr, K_dim, N_dim);
+
+  auto b_user_mem = dnnl::memory(b_user_md, eng, unpacked.data());
+  dnnl::memory b_reordered;
+  if (pd.weights_desc() != b_user_md) {
+    b_reordered = dnnl::memory(pd.weights_desc(), eng);
+    dnnl::reorder(b_user_mem, b_reordered).execute(s, b_user_mem, b_reordered);
+    s.wait();
+  } else {
+    // Allocate a persistent copy since unpacked is temporary
+    b_reordered = dnnl::memory(b_user_md, eng);
+    std::memcpy(b_reordered.get_data_handle(), unpacked.data(), K_dim * N_dim);
+  }
+
+  // Insert into cache
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto [it, inserted] = cache.entries.emplace(
+      weight_ptr,
+      OneDNNWeightCache::CacheEntry{std::move(b_reordered), std::move(pd), std::move(prim), std::move(scratchpad_md)});
+  return &it->second;
 }
 
 }  // anonymous namespace
@@ -923,41 +999,95 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_e = 2 * N * packed_K;
   const int64_t stride_n = packed_K;
 
-  // Initialize oneDNN engine (shared across threads)
-  static engine eng(engine::kind::cpu, 0);
+  auto& eng = get_onednn_engine();
+
+  // Pre-reorder all w1 weight blocks before entering parallel region.
+  // w1 has shape [E, 2N, K] packed as [E, 2*NB blocks, BLOCK_N, packed_K].
+  // We iterate over all (expert, nb_upper, nb_lower) combinations.
+  {
+    // Collect unique weight pointers to reorder
+    std::vector<const int8_t*> w1_ptrs;
+    w1_ptrs.reserve(E * 2 * NB);
+    for (int64_t e = 0; e < E; ++e) {
+      for (int64_t nb = 0; nb < NB; ++nb) {
+        int64_t nb_upper = nb;
+        int64_t nb_lower = nb + NB;
+        const int8_t* p0 = packed_w1 + e * stride_e + nb_upper * BLOCK_N * stride_n;
+        const int8_t* p1 = packed_w1 + e * stride_e + nb_lower * BLOCK_N * stride_n;
+        w1_ptrs.push_back(p0);
+        w1_ptrs.push_back(p1);
+      }
+    }
+    // Pre-reorder in parallel
+    at::parallel_for(0, (int64_t)w1_ptrs.size(), 0, [&](int64_t begin, int64_t end) {
+      for (int64_t i = begin; i < end; ++i) {
+        get_or_create_cached_weight(w1_ptrs[i], K, BLOCK_N, BLOCK_M);
+      }
+    });
+  }
 
   // Stage 1: w1 matmul using parallel_2d
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-    // Thread-local resources
     int tid = get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
     int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
     alignas(64) float As[BLOCK_M];
-    
+
     // Thread-local oneDNN stream
     stream s(eng);
-    
-    // Thread-local unpacked weight buffer (reused across iterations)
-    std::vector<int8_t> B_unpacked(K * BLOCK_N);
-    
-    // Thread-local cache for primitives
-    auto& cache = tls_weight_cache;
+
+    // Memory descriptors for BLOCK_M (fixed)
+    memory::desc a_md({BLOCK_M, K}, memory::data_type::u8, memory::format_tag::ab);
+    memory::desc c_md({BLOCK_M, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
+
+    // Reusable memory objects that point to thread-local buffers
+    auto a_mem = memory(a_md, eng, A);
+    auto c0_mem = memory(c_md, eng, C0);
+    auto c1_mem = memory(c_md, eng, C1);
+
+    // Allocate per-thread scratchpad for user-managed scratchpad mode
+    // All w1 blocks have same K, BLOCK_N so same scratchpad size
+    // We look up any entry to get the scratchpad desc
+    dnnl::memory scratchpad_mem;
+    {
+      auto& wcache_ref = OneDNNWeightCache::instance();
+      const int8_t* first_w1 = packed_w1 + 0;  // expert 0, block 0
+      auto* first_entry = wcache_ref.find_lockfree(first_w1);
+      if (first_entry && first_entry->scratchpad_md.get_size() > 0) {
+        scratchpad_mem = memory(first_entry->scratchpad_md, eng);
+      }
+    }
+
+    // Pre-build reusable arg maps (avoid heap allocation per execute call)
+    // Weights and scratchpad will be updated per iteration
+    std::unordered_map<int, memory> args0 = {
+        {DNNL_ARG_SRC, a_mem},
+        {DNNL_ARG_WEIGHTS, a_mem},  // placeholder, updated below
+        {DNNL_ARG_DST, c0_mem},
+        {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
+    };
+    std::unordered_map<int, memory> args1 = {
+        {DNNL_ARG_SRC, a_mem},
+        {DNNL_ARG_WEIGHTS, a_mem},  // placeholder, updated below
+        {DNNL_ARG_DST, c1_mem},
+        {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
+    };
+
+    auto& wcache = OneDNNWeightCache::instance();
 
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t nb_upper = nb, nb_lower = nb + NB;
       int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
 
       int32_t expert_id = expert_ids[mb];
-      
-      // B shape [K, n_size] in vnni format
+
       const int8_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
       const int8_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n;
       const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb_upper * BLOCK_N;
       const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb_lower * BLOCK_N;
 
-      // Get compensation from packed buffer
       const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + BLOCK_N * K);
       const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + BLOCK_N * K);
 
@@ -965,95 +1095,33 @@ void fused_experts_int8_kernel_impl(
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
 
+      // Zero pad the A buffer for m_size < BLOCK_M so extra rows produce 0
+      if (m_size < BLOCK_M) {
+        std::memset(A + m_size * K, 0, (BLOCK_M - m_size) * K);
+      }
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m] / topk;
         copy_stub(A + m * K, Aq_tmp + index * K, K);
         As[m] = As_tmp[index];
       }
-      
-      // Create cache keys (include m_size in key since it affects primitive)
-      std::string key0 = cache.make_key(expert_id, nb_upper, "w1", K, BLOCK_N) + "_m" + std::to_string(m_size);
-      std::string key1 = cache.make_key(expert_id, nb_lower, "w1", K, BLOCK_N) + "_m" + std::to_string(m_size);
-      
-      // 1.b Setup and execute matmul for B0 (use m_size, not BLOCK_M)
-      memory::desc a_md({m_size, K}, memory::data_type::u8, memory::format_tag::ab);
-      memory::desc b_user_md({K, BLOCK_N}, memory::data_type::s8, memory::format_tag::ab);
-      memory::desc b_opt_md({K, BLOCK_N}, memory::data_type::s8, memory::format_tag::any);
-      memory::desc c_md({m_size, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
-      
-      // Check if primitive_desc is cached
-      if (cache.primitive_descs.find(key0) == cache.primitive_descs.end()) {
-        cache.primitive_descs[key0] = matmul::primitive_desc(eng, a_md, b_opt_md, c_md);
-        cache.primitives[key0] = matmul(cache.primitive_descs[key0]);
-      }
-      
-      auto& pd0 = cache.primitive_descs[key0];
-      auto& prim0 = cache.primitives[key0];
-      
-      // Check if weights need reordering
-      memory b0_mem;
-      if (cache.reordered_weights.find(key0) == cache.reordered_weights.end()) {
-        // Unpack VNNI weights
-        unpack_vnni_weights(B_unpacked.data(), B0, K, BLOCK_N);
-        
-        auto b_user_mem = memory(b_user_md, eng, B_unpacked.data());
-        if (pd0.weights_desc() != b_user_md) {
-          cache.reordered_weights[key0] = memory(pd0.weights_desc(), eng);
-          dnnl::reorder(b_user_mem, cache.reordered_weights[key0])
-              .execute(s, b_user_mem, cache.reordered_weights[key0]);
-          s.wait();
-        } else {
-          cache.reordered_weights[key0] = b_user_mem;
-        }
-      }
-      b0_mem = cache.reordered_weights[key0];
-      
-      auto a_mem = memory(a_md, eng, A);
-      auto c0_mem = memory(c_md, eng, C0);
-      
-      prim0.execute(s, {
-          {DNNL_ARG_SRC, a_mem},
-          {DNNL_ARG_WEIGHTS, b0_mem},
-          {DNNL_ARG_DST, c0_mem}
-      });
-      
-      // 1.c Setup and execute matmul for B1
-      if (cache.primitive_descs.find(key1) == cache.primitive_descs.end()) {
-        cache.primitive_descs[key1] = matmul::primitive_desc(eng, a_md, b_opt_md, c_md);
-        cache.primitives[key1] = matmul(cache.primitive_descs[key1]);
-      }
-      
-      auto& pd1 = cache.primitive_descs[key1];
-      auto& prim1 = cache.primitives[key1];
-      
-      memory b1_mem;
-      if (cache.reordered_weights.find(key1) == cache.reordered_weights.end()) {
-        // Unpack VNNI weights
-        unpack_vnni_weights(B_unpacked.data(), B1, K, BLOCK_N);
-        
-        auto b_user_mem = memory(b_user_md, eng, B_unpacked.data());
-        if (pd1.weights_desc() != b_user_md) {
-          cache.reordered_weights[key1] = memory(pd1.weights_desc(), eng);
-          dnnl::reorder(b_user_mem, cache.reordered_weights[key1])
-              .execute(s, b_user_mem, cache.reordered_weights[key1]);
-          s.wait();
-        } else {
-          cache.reordered_weights[key1] = b_user_mem;
-        }
-      }
-      b1_mem = cache.reordered_weights[key1];
-      
-      auto c1_mem = memory(c_md, eng, C1);
-      
-      prim1.execute(s, {
-          {DNNL_ARG_SRC, a_mem},
-          {DNNL_ARG_WEIGHTS, b1_mem},
-          {DNNL_ARG_DST, c1_mem}
-      });
-      
+
+      // Lookup pre-reordered weights (lock-free, no concurrent writes)
+      auto* entry0 = wcache.find_lockfree(B0);
+      auto* entry1 = wcache.find_lockfree(B1);
+
+      // Update weight references in pre-built arg maps
+      args0[DNNL_ARG_WEIGHTS] = entry0->reordered_weight;
+      args1[DNNL_ARG_WEIGHTS] = entry1->reordered_weight;
+
+      // 1.b Execute matmul for B0: C0 = A @ B0
+      entry0->primitive.execute(s, args0);
+
+      // 1.c Execute matmul for B1: C1 = A @ B1
+      entry1->primitive.execute(s, args1);
+
       s.wait();
 
-      // 1.d silu and mul (using baseline's optimized SIMD function)
+      // 1.d silu and mul
       const int64_t offset = offsets[mb];
       silu_and_mul<scalar_t, BLOCK_N>(
           ic1 + offset * N + nb * BLOCK_N, C0, C1, As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N);
@@ -1075,89 +1143,109 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_e2 = OC * packed_N;
   const int64_t stride_oc = packed_N;
 
+  // Pre-reorder all w2 weight blocks
+  {
+    std::vector<const int8_t*> w2_ptrs;
+    w2_ptrs.reserve(E * NB2);
+    for (int64_t e = 0; e < E; ++e) {
+      for (int64_t nb = 0; nb < NB2; ++nb) {
+        const int8_t* p = packed_w2 + e * stride_e2 + nb * BLOCK_N * stride_oc;
+        w2_ptrs.push_back(p);
+      }
+    }
+    at::parallel_for(0, (int64_t)w2_ptrs.size(), 0, [&](int64_t begin, int64_t end) {
+      for (int64_t i = begin; i < end; ++i) {
+        get_or_create_cached_weight(w2_ptrs[i], IC, BLOCK_N, BLOCK_M);
+      }
+    });
+  }
+
   // Stage 2: w2 matmul using parallel_2d
   parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-    // Thread-local resources
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
-    
+
+    // Reuse A_tmp as padded buffer for blocks with m_size < BLOCK_M.
+    // A_tmp per thread is BLOCK_M * K bytes, and IC = N <= K (typical),
+    // so BLOCK_M * IC fits. For safety, allocate on heap if K < IC.
+    uint8_t* __restrict__ A_pad = (K >= IC) ? (A_tmp + tid * BLOCK_M * K) : nullptr;
+    std::vector<uint8_t> A_pad_heap;
+    if (K < IC) {
+      A_pad_heap.resize(BLOCK_M * IC, 0);
+      A_pad = A_pad_heap.data();
+    }
+
     // Thread-local oneDNN stream
     stream s(eng);
-    
-    // Thread-local unpacked weight buffer
-    std::vector<int8_t> B_unpacked(IC * BLOCK_N);
-    
-    // Thread-local cache
-    auto& cache = tls_weight_cache;
+
+    // Memory descriptors for BLOCK_M (fixed)
+    memory::desc a_md({BLOCK_M, IC}, memory::data_type::u8, memory::format_tag::ab);
+    memory::desc c_md({BLOCK_M, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
+
+    // Allocate per-thread scratchpad for user-managed scratchpad mode
+    dnnl::memory scratchpad_mem;
+    {
+      auto& wcache_ref = OneDNNWeightCache::instance();
+      const int8_t* first_w2 = packed_w2 + 0;
+      auto* first_entry = wcache_ref.find_lockfree(first_w2);
+      if (first_entry && first_entry->scratchpad_md.get_size() > 0) {
+        scratchpad_mem = memory(first_entry->scratchpad_md, eng);
+      }
+    }
+
+    // Pre-build reusable arg map
+    auto a_mem = memory(a_md, eng, A_pad);  // placeholder data handle
+    auto c_mem = memory(c_md, eng, C32);
+    std::unordered_map<int, memory> args = {
+        {DNNL_ARG_SRC, a_mem},
+        {DNNL_ARG_WEIGHTS, a_mem},  // placeholder
+        {DNNL_ARG_DST, c_mem},
+        {DNNL_ARG_SCRATCHPAD, scratchpad_mem}
+    };
+
+    auto& wcache = OneDNNWeightCache::instance();
 
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
 
       // A ptr from ic1 of [M * topk, N] in sorted order
-      const uint8_t* __restrict__ A = Aq_tmp + offsets[mb] * N;
+      const uint8_t* __restrict__ A_orig = Aq_tmp + offsets[mb] * N;
       const float* __restrict__ As = As_tmp + offsets[mb];
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
 
-      // B shape [IC, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
       const int8_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
       const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
-      
-      // Get compensation from packed buffer
+
       const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + BLOCK_N * IC);
 
-      // Create cache key (include m_size in key)
-      std::string key = cache.make_key(expert_id, nb, "w2", IC, BLOCK_N) + "_m" + std::to_string(m_size);
-      
-      // Setup memory descriptors (use m_size, not BLOCK_M)
-      memory::desc a_md({m_size, IC}, memory::data_type::u8, memory::format_tag::ab);
-      memory::desc b_user_md({IC, BLOCK_N}, memory::data_type::s8, memory::format_tag::ab);
-      memory::desc b_opt_md({IC, BLOCK_N}, memory::data_type::s8, memory::format_tag::any);
-      memory::desc c_md({m_size, BLOCK_N}, memory::data_type::s32, memory::format_tag::ab);
-      
-      // Check if primitive_desc is cached
-      if (cache.primitive_descs.find(key) == cache.primitive_descs.end()) {
-        cache.primitive_descs[key] = matmul::primitive_desc(eng, a_md, b_opt_md, c_md);
-        cache.primitives[key] = matmul(cache.primitive_descs[key]);
+      // Lookup pre-reordered weights (lock-free, no concurrent writes)
+      auto* entry = wcache.find_lockfree(B);
+
+      // Handle A memory: if m_size < BLOCK_M, copy to padded buffer
+      // to avoid reading past buffer bounds
+      const uint8_t* A_ptr;
+      if (m_size < BLOCK_M) {
+        std::memcpy(A_pad, A_orig, m_size * IC);
+        std::memset(A_pad + m_size * IC, 0, (BLOCK_M - m_size) * IC);
+        A_ptr = A_pad;
+      } else {
+        A_ptr = A_orig;
       }
-      
-      auto& pd = cache.primitive_descs[key];
-      auto& prim = cache.primitives[key];
-      
-      // Check if weights need reordering
-      memory b_mem;
-      if (cache.reordered_weights.find(key) == cache.reordered_weights.end()) {
-        // Unpack VNNI weights
-        unpack_vnni_weights(B_unpacked.data(), B, IC, BLOCK_N);
-        
-        auto b_user_mem = memory(b_user_md, eng, B_unpacked.data());
-        if (pd.weights_desc() != b_user_md) {
-          cache.reordered_weights[key] = memory(pd.weights_desc(), eng);
-          dnnl::reorder(b_user_mem, cache.reordered_weights[key])
-              .execute(s, b_user_mem, cache.reordered_weights[key]);
-          s.wait();
-        } else {
-          cache.reordered_weights[key] = b_user_mem;
-        }
-      }
-      b_mem = cache.reordered_weights[key];
-      
-      auto a_mem = memory(a_md, eng, const_cast<uint8_t*>(A));
-      auto c_mem = memory(c_md, eng, C32);
-      
-      prim.execute(s, {
-          {DNNL_ARG_SRC, a_mem},
-          {DNNL_ARG_WEIGHTS, b_mem},
-          {DNNL_ARG_DST, c_mem}
-      });
+
+      // Update arg map with current pointers
+      a_mem.set_data_handle(const_cast<uint8_t*>(A_ptr));
+      args[DNNL_ARG_WEIGHTS] = entry->reordered_weight;
+
+      entry->primitive.execute(s, args);
       s.wait();
 
-      // 2.c apply scales using baseline's SIMD function
+      // apply scales
       scale_C<BLOCK_N>(C, C32, As, Bs, Bcomp, m_size);
 
-      // 2.d copy from C to ic2 in original order and mul topk_weights
+      // copy from C to ic2 in original order and mul topk_weights
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m];
         float weight = topk_weights[index];
