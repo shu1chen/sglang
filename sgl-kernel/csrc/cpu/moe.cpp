@@ -1048,9 +1048,10 @@ at::Tensor fused_experts_cpu(
   //   1. intermediate_cache1 : [M * topk, N]
   //   2. intermediate_cache2 : [M * topk, K]
   //   3. A_tmp : [T, BLOCK_M * K]
-  //   4. C_tmp : [T, 2 * BLOCK_M * BLOCK_N]
+  //   4. C_tmp : [T, 2 * BLOCK_M * C_BLOCK_N]
   //
   // for int8 w8a8:
+  //   C_BLOCK_N = matmul_block_n() (wider matmul blocks for oneDNN)
   //   5. Aq_tmp : [M, K] or [M * topk, N]
   //   6. As_tmp : [M * topk]
   //
@@ -1058,12 +1059,16 @@ at::Tensor fused_experts_cpu(
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
   //
+  const int64_t C_BLOCK_N = use_int8_w8a8 ? matmul_block_n() : BLOCK_N;
   int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
                                num_threads * BLOCK_M * K * (use_int8_w8a8 ? 1 : 2) +
-                               num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
+                               num_threads * 2 * BLOCK_M * C_BLOCK_N * sizeof(float);
 
   if (use_int8_w8a8) {
-    buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
+    // Aq_tmp: reused for Stage 0 [M, K] and Stage 1.5 [M*topk, N]
+    // Add BLOCK_M padding rows so oneDNN matmul can safely over-read past last block
+    // As_tmp: [M*topk + BLOCK_M] to match Aq_tmp padding
+    buffer_size_nbytes += std::max(M * K, (M * topk + BLOCK_M) * N) + (M * topk + BLOCK_M) * (int64_t)sizeof(float);
   }
   if (use_fp8_w8a16) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
@@ -1078,8 +1083,8 @@ at::Tensor fused_experts_cpu(
     if (use_int8_w8a8) {
       uint8_t* __restrict__ A_tmp = (uint8_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
-      uint8_t* __restrict__ Aq_tmp = (uint8_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
-      float* __restrict__ As_tmp = (float*)((void*)(Aq_tmp + std::max(M * K, M * topk * N)));
+      uint8_t* __restrict__ Aq_tmp = (uint8_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * C_BLOCK_N));
+      float* __restrict__ As_tmp = (float*)((void*)(Aq_tmp + std::max(M * K, (M * topk + BLOCK_M) * N)));
 
       auto w1s = w1_scale.value();
       auto w2s = w2_scale.value();

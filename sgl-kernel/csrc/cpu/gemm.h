@@ -16,6 +16,11 @@ constexpr int block_size_n() {
   return 2 * TILE_N;
 }
 
+// Width of oneDNN matmul blocks for int8 MoE (must be multiple of block_size_n)
+constexpr int matmul_block_n() {
+  return 128;
+}
+
 // define threshold using brgemm (intel AMX)
 template <typename T>
 inline bool can_use_brgemm(int M);

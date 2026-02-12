@@ -233,20 +233,23 @@ inline void scale_C(
 
 // Strided version of silu_and_mul: reads C0/C1 from a large [BLOCK_M, ldc] buffer
 // where C0 starts at column offset col0 and C1 at col1, both with stride ldc.
+// Strided version of silu_and_mul: reads gate from C0_buf at col0 offset
+// and up from C1_buf at col1 offset, both with leading dim ldc.
 template <typename scalar_t, int BLOCK_N>
 inline void silu_and_mul_strided(
     scalar_t* __restrict__ C,
-    const int32_t* __restrict__ C_full,  // full [BLOCK_M, ldc] buffer
-    int64_t col0,                        // column offset for gate (C0)
-    int64_t col1,                        // column offset for up (C1)
-    int64_t ldc,                         // leading dimension (total columns)
+    const int32_t* __restrict__ C0_buf,  // gate buffer [BLOCK_M, ldc]
+    int64_t col0,                        // column offset within C0_buf
+    const int32_t* __restrict__ C1_buf,  // up buffer [BLOCK_M, ldc]
+    int64_t col1,                        // column offset within C1_buf
     const float* __restrict__ As,
     const float* __restrict__ Bs0,
     const float* __restrict__ Bs1,
     const int32_t* __restrict__ Bcomp0,
     const int32_t* __restrict__ Bcomp1,
     int64_t m_size,
-    int64_t N) {
+    int64_t N,
+    int64_t ldc) {
 #if defined(CPU_CAPABILITY_AVX512)
   constexpr int COLS = BLOCK_N / 16;
   static_assert(COLS % 2 == 0);
@@ -269,8 +272,8 @@ inline void silu_and_mul_strided(
 
   auto scalec = [&](auto col, int64_t m) {
     vas = _mm512_set1_ps(As[m]);
-    __m512i vc32_0 = _mm512_loadu_si512(C_full + m * ldc + col0 + col * 16);
-    __m512i vc32_1 = _mm512_loadu_si512(C_full + m * ldc + col1 + col * 16);
+    __m512i vc32_0 = _mm512_loadu_si512(C0_buf + m * ldc + col0 + col * 16);
+    __m512i vc32_1 = _mm512_loadu_si512(C1_buf + m * ldc + col1 + col * 16);
     vc0[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32_0, vcomp0[col]));
     vc1[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32_1, vcomp1[col]));
     vc0[col] = _mm512_mul_ps(_mm512_mul_ps(vc0[col], vas), vbs0[col]);
@@ -306,17 +309,19 @@ inline void silu_and_mul_strided(
 #endif
 }
 
-// Strided version of scale_C: reads from a large [BLOCK_M, ldc] buffer at column offset col_off
+// Strided version of scale_C: reads from C_in at col_in offset with stride ldc_in,
+// writes to C_out at col_out offset with stride ldc_out
 template <int BLOCK_N>
 inline void scale_C_strided(
-    float* __restrict__ C,
-    const int32_t* __restrict__ C_full,  // full [BLOCK_M, ldc] buffer
-    int64_t col_off,                     // column offset
-    int64_t ldc,                         // leading dimension
+    float* __restrict__ C_out,
+    int64_t col_out,                     // column offset in output
+    const int32_t* __restrict__ C_in,    // input [BLOCK_M, ldc_in] buffer
+    int64_t col_in,                      // column offset in input
     const float* __restrict__ As,
     const float* __restrict__ Bs,
     const int32_t* __restrict__ Bcomp,
-    int64_t m_size) {
+    int64_t m_size,
+    int64_t ldc) {
 #if defined(CPU_CAPABILITY_AVX512)
   constexpr int COLS = BLOCK_N / 16;
   static_assert(COLS % 2 == 0);
@@ -334,10 +339,10 @@ inline void scale_C_strided(
 
   auto scalec = [&](auto col, int64_t m) {
     vas = _mm512_set1_ps(As[m]);
-    __m512i vc32 = _mm512_loadu_si512(C_full + m * ldc + col_off + col * 16);
+    __m512i vc32 = _mm512_loadu_si512(C_in + m * ldc + col_in + col * 16);
     vc[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32, vcomp[col]));
     vc[col] = _mm512_mul_ps(_mm512_mul_ps(vc[col], vas), vbs[col]);
-    _mm512_storeu_ps(C + m * BLOCK_N + col * 16, vc[col]);
+    _mm512_storeu_ps(C_out + m * ldc + col_out + col * 16, vc[col]);
   };
 
   for (int64_t m = 0; m < m_size; ++m) {
@@ -952,10 +957,15 @@ void fused_experts_int8_kernel_impl(
 //
 // Uses the same cache-friendly blocking as baseline (parallel_2d + loop_2d)
 // but replaces brgemm with oneDNN matmul primitives. Each weight block
-// [K, BLOCK_N] is cached as an optimally-formatted oneDNN memory with
+// [K, MATMUL_N] is cached as an optimally-formatted oneDNN memory with
 // format_tag::any, and the matmul primitive is also cached.
 //
+// MATMUL_N (128) is wider than BLOCK_N (32) to reduce the number of
+// dnnl_primitive_execute calls. Post-processing (silu_and_mul, scale_C)
+// still operates on BLOCK_N=32 sub-blocks since Bcomp/Bs are per-BLOCK_N.
+//
 // Key optimizations:
+//   - Wide matmul blocks: 4× fewer dispatch calls (MATMUL_N/BLOCK_N = 4)
 //   - Global weight cache: one reorder per weight block, amortized over calls
 //   - Thread-local stream/memory: avoid per-call dnnl object creation
 //   - Flat lookup table: O(1) expert×block → CacheEntry* via raw array
@@ -963,6 +973,9 @@ void fused_experts_int8_kernel_impl(
 //   - last_mb caching: skip redundant A copies when same mb repeats
 //   - Pointer tracking: skip redundant dnnl_memory_set_data_handle
 // ============================================================================
+
+// Width of oneDNN matmul blocks — must be multiple of BLOCK_N
+static constexpr int64_t MATMUL_N = matmul_block_n();
 
 namespace {
 
@@ -993,6 +1006,7 @@ struct OneDNNWeightCache {
 };
 
 // Unpack VNNI [K/4, BLOCK_N, 4] to plain [K, BLOCK_N] and create oneDNN cached entry
+// For a single BLOCK_N-wide block.
 inline const OneDNNWeightCache::CacheEntry* get_or_create_weight(
     const int8_t* vnni_ptr,
     int64_t K_dim,
@@ -1060,19 +1074,105 @@ inline const OneDNNWeightCache::CacheEntry* get_or_create_weight(
   return &it->second;
 }
 
-// ---- Flat lookup table: entries[expert * NB + nb] ----
+// Create a wide matmul entry by concatenating num_sub adjacent VNNI blocks
+// into a single [K, wide_N] matrix. Each sub-block is [K/4, BLOCK_N_sub, 4]
+// with stride stride_n between sub-blocks.
+// Key is the pointer to the first sub-block.
+inline const OneDNNWeightCache::CacheEntry* get_or_create_wide_weight(
+    const int8_t* first_vnni_ptr,
+    int64_t K_dim,
+    int64_t BLOCK_N_sub,
+    int64_t num_sub,
+    int64_t stride_n,  // byte stride between sub-blocks (packed_K)
+    int64_t BLOCK_M_dim) {
+  auto& cache = OneDNNWeightCache::instance();
+  // Use a unique key: combine first_vnni_ptr with num_sub to distinguish wide vs narrow
+  // Since wide entries start at same ptr as narrow, we offset the key
+  const void* key = reinterpret_cast<const void*>(
+      reinterpret_cast<uintptr_t>(first_vnni_ptr) | (static_cast<uintptr_t>(num_sub) << 48));
+
+  // Lock-free fast path
+  {
+    auto it = cache.entries.find(key);
+    if (it != cache.entries.end()) {
+      return &it->second;
+    }
+  }
+
+  const int64_t wide_N = BLOCK_N_sub * num_sub;
+  auto& eng = get_onednn_engine();
+  dnnl::stream s(eng);
+
+  dnnl::memory::desc a_md({BLOCK_M_dim, K_dim}, dnnl::memory::data_type::u8, dnnl::memory::format_tag::ab);
+  dnnl::memory::desc b_user_md({K_dim, wide_N}, dnnl::memory::data_type::s8, dnnl::memory::format_tag::ab);
+  dnnl::memory::desc b_opt_md({K_dim, wide_N}, dnnl::memory::data_type::s8, dnnl::memory::format_tag::any);
+  dnnl::memory::desc c_md({BLOCK_M_dim, wide_N}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::ab);
+
+  dnnl::primitive_attr attr;
+  attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+
+  auto pd = dnnl::matmul::primitive_desc(eng, a_md, b_opt_md, c_md, attr);
+  auto prim = dnnl::matmul(pd);
+  auto sp_md = pd.scratchpad_desc();
+
+  // Unpack from multiple VNNI blocks to plain [K, wide_N]
+  std::vector<int8_t> unpacked(K_dim * wide_N);
+  constexpr int VNNI_BLK = 4;
+  const int64_t K_groups = K_dim / VNNI_BLK;
+
+  for (int64_t s_idx = 0; s_idx < num_sub; ++s_idx) {
+    const int8_t* vnni_ptr = first_vnni_ptr + s_idx * BLOCK_N_sub * stride_n;
+    const int64_t col_offset = s_idx * BLOCK_N_sub;
+    for (int64_t k_group = 0; k_group < K_groups; ++k_group) {
+      for (int64_t n = 0; n < BLOCK_N_sub; ++n) {
+        for (int64_t d = 0; d < VNNI_BLK; ++d) {
+          int64_t k = k_group * VNNI_BLK + d;
+          unpacked[k * wide_N + col_offset + n] =
+              vnni_ptr[k_group * BLOCK_N_sub * VNNI_BLK + n * VNNI_BLK + d];
+        }
+      }
+    }
+  }
+
+  auto b_user_mem = dnnl::memory(b_user_md, eng, unpacked.data());
+  dnnl::memory b_reordered;
+  if (pd.weights_desc() != b_user_md) {
+    b_reordered = dnnl::memory(pd.weights_desc(), eng);
+    dnnl::reorder(b_user_mem, b_reordered).execute(s, b_user_mem, b_reordered);
+    s.wait();
+  } else {
+    b_reordered = dnnl::memory(b_user_md, eng);
+    std::memcpy(b_reordered.get_data_handle(), unpacked.data(), K_dim * wide_N);
+  }
+
+  dnnl_memory_t raw_w = b_reordered.get();
+  dnnl_primitive_t raw_p = prim.get();
+
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto [it, inserted] = cache.entries.emplace(
+      key,
+      OneDNNWeightCache::CacheEntry{
+          std::move(b_reordered), raw_w, raw_p,
+          std::move(pd), std::move(prim), std::move(sp_md)});
+  return &it->second;
+}
+
+// ---- Flat lookup table: entries[expert * NB_wide + nb_wide] ----
+// Each entry points to a wide matmul CacheEntry covering MATMUL_N columns.
 struct FlatTableCache {
   struct TableKey {
     const void* weight_ptr;
     int64_t total_entries;
+    int64_t matmul_n;  // distinguish different widths
     bool operator==(const TableKey& o) const {
-      return weight_ptr == o.weight_ptr && total_entries == o.total_entries;
+      return weight_ptr == o.weight_ptr && total_entries == o.total_entries && matmul_n == o.matmul_n;
     }
   };
   struct TableKeyHash {
     size_t operator()(const TableKey& k) const {
       return std::hash<const void*>{}(k.weight_ptr) ^
-             (std::hash<int64_t>{}(k.total_entries) << 1);
+             (std::hash<int64_t>{}(k.total_entries) << 1) ^
+             (std::hash<int64_t>{}(k.matmul_n) << 2);
     }
   };
   struct Table {
@@ -1087,23 +1187,40 @@ struct FlatTableCache {
     return cache;
   }
 
-  // Build flat table for w1: entries[e * 2*NB + nb]
-  // First NB entries per expert = gate blocks, next NB = up blocks
+  // Build wide flat table for w1: entries[e * 2*NB_wide + nb_wide]
+  // First NB_wide entries per expert = gate blocks, next NB_wide = up blocks
+  // Each entry covers actual_matmul_n columns (may be < matmul_n for last block)
   const std::vector<const OneDNNWeightCache::CacheEntry*>& get_w1_table(
-      const int8_t* packed_w1, int64_t E, int64_t NB, int64_t K,
-      int64_t BLOCK_N, int64_t BLOCK_M, int64_t stride_e, int64_t stride_n) {
-    const int64_t total = E * 2 * NB;
-    TableKey key{packed_w1, total};
+      const int8_t* packed_w1, int64_t E, int64_t NB, int64_t NB_wide,
+      int64_t K, int64_t BLOCK_N_val, int64_t matmul_n, int64_t BLOCK_M,
+      int64_t stride_e, int64_t stride_n, int64_t N) {
+    const int64_t total = E * 2 * NB_wide;
+    TableKey key{packed_w1, total, matmul_n};
     {
       auto it = tables.find(key);
       if (it != tables.end()) return it->second.entries;
     }
 
+    const int64_t sub_per_wide = matmul_n / BLOCK_N_val;
     std::vector<const OneDNNWeightCache::CacheEntry*> entries(total);
     for (int64_t e = 0; e < E; ++e) {
-      for (int64_t nb = 0; nb < 2 * NB; ++nb) {
-        const int8_t* ptr = packed_w1 + e * stride_e + nb * BLOCK_N * stride_n;
-        entries[e * 2 * NB + nb] = get_or_create_weight(ptr, K, BLOCK_N, BLOCK_M);
+      // Gate and up halves each have NB sub-blocks
+      for (int64_t half = 0; half < 2; ++half) {
+        for (int64_t nbw = 0; nbw < NB_wide; ++nbw) {
+          int64_t first_nb = nbw * sub_per_wide;  // first sub-block index within this half
+          int64_t remaining = NB - first_nb;  // remaining sub-blocks
+          int64_t num_sub = std::min(sub_per_wide, remaining);
+          int64_t abs_nb = half * NB + first_nb;  // index in the full 2*N layout
+          const int8_t* ptr = packed_w1 + e * stride_e + abs_nb * BLOCK_N_val * stride_n;
+          if (num_sub == sub_per_wide) {
+            entries[e * 2 * NB_wide + half * NB_wide + nbw] =
+                get_or_create_wide_weight(ptr, K, BLOCK_N_val, num_sub, stride_n, BLOCK_M);
+          } else {
+            // Last block may be narrower - still create with actual width
+            entries[e * 2 * NB_wide + half * NB_wide + nbw] =
+                get_or_create_wide_weight(ptr, K, BLOCK_N_val, num_sub, stride_n, BLOCK_M);
+          }
+        }
       }
     }
 
@@ -1112,22 +1229,28 @@ struct FlatTableCache {
     return it->second.entries;
   }
 
-  // Build flat table for w2: entries[e * NB2 + nb]
+  // Build wide flat table for w2: entries[e * NB2_wide + nb_wide]
   const std::vector<const OneDNNWeightCache::CacheEntry*>& get_w2_table(
-      const int8_t* packed_w2, int64_t E, int64_t NB2, int64_t IC,
-      int64_t BLOCK_N, int64_t BLOCK_M, int64_t stride_e2, int64_t stride_oc) {
-    const int64_t total = E * NB2;
-    TableKey key{packed_w2, total};
+      const int8_t* packed_w2, int64_t E, int64_t NB2, int64_t NB2_wide,
+      int64_t IC, int64_t BLOCK_N_val, int64_t matmul_n, int64_t BLOCK_M,
+      int64_t stride_e2, int64_t stride_oc, int64_t OC) {
+    const int64_t total = E * NB2_wide;
+    TableKey key{packed_w2, total, matmul_n};
     {
       auto it = tables.find(key);
       if (it != tables.end()) return it->second.entries;
     }
 
+    const int64_t sub_per_wide = matmul_n / BLOCK_N_val;
     std::vector<const OneDNNWeightCache::CacheEntry*> entries(total);
     for (int64_t e = 0; e < E; ++e) {
-      for (int64_t nb = 0; nb < NB2; ++nb) {
-        const int8_t* ptr = packed_w2 + e * stride_e2 + nb * BLOCK_N * stride_oc;
-        entries[e * NB2 + nb] = get_or_create_weight(ptr, IC, BLOCK_N, BLOCK_M);
+      for (int64_t nbw = 0; nbw < NB2_wide; ++nbw) {
+        int64_t first_nb = nbw * sub_per_wide;
+        int64_t remaining = NB2 - first_nb;
+        int64_t num_sub = std::min(sub_per_wide, remaining);
+        const int8_t* ptr = packed_w2 + e * stride_e2 + first_nb * BLOCK_N_val * stride_oc;
+        entries[e * NB2_wide + nbw] =
+            get_or_create_wide_weight(ptr, IC, BLOCK_N_val, num_sub, stride_oc, BLOCK_M);
       }
     }
 
@@ -1142,11 +1265,11 @@ struct ThreadLocalHandles {
   dnnl::stream stream;
   dnnl_stream_t raw_stream = nullptr;
 
-  // Stage 1 handles: [BLOCK_M, K] × [K, BLOCK_N] → [BLOCK_M, BLOCK_N]
+  // Stage 1 handles: [BLOCK_M, K] × [K, matmul_n] → [BLOCK_M, matmul_n]
   dnnl::memory a1_mem, c1_0_mem, c1_1_mem, sp1_mem;
   dnnl_memory_t raw_a1 = nullptr, raw_c1_0 = nullptr, raw_c1_1 = nullptr, raw_sp1 = nullptr;
 
-  // Stage 2 handles: [BLOCK_M, IC] × [IC, BLOCK_N] → [BLOCK_M, BLOCK_N]
+  // Stage 2 handles: [BLOCK_M, IC] × [IC, matmul_n] → [BLOCK_M, matmul_n]
   dnnl::memory a2_mem, c2_mem, sp2_mem;
   dnnl_memory_t raw_a2 = nullptr, raw_c2 = nullptr, raw_sp2 = nullptr;
 
@@ -1164,16 +1287,16 @@ struct ThreadLocalHandles {
   void* last_c2_ptr = nullptr;
 
   void ensure_stage1(dnnl::engine& eng, int64_t BLOCK_M_val, int64_t K_val,
-                     int64_t N_val, const dnnl::memory::desc& sp_md,
+                     int64_t matmul_n_val, const dnnl::memory::desc& sp_md,
                      void* A_buf, int32_t* C0_buf, int32_t* C1_buf) {
     using namespace dnnl;
     size_t sp_size = sp_md.get_size();
-    if (!initialized || s1_K != K_val || s1_N != N_val || s1_sp_size != sp_size) {
+    if (!initialized || s1_K != K_val || s1_N != matmul_n_val || s1_sp_size != sp_size) {
       stream = dnnl::stream(eng);
       raw_stream = stream.get();
 
       memory::desc a_md({BLOCK_M_val, K_val}, memory::data_type::u8, memory::format_tag::ab);
-      memory::desc c_md({BLOCK_M_val, N_val}, memory::data_type::s32, memory::format_tag::ab);
+      memory::desc c_md({BLOCK_M_val, matmul_n_val}, memory::data_type::s32, memory::format_tag::ab);
       a1_mem = memory(a_md, eng, A_buf);
       c1_0_mem = memory(c_md, eng, C0_buf);
       c1_1_mem = memory(c_md, eng, C1_buf);
@@ -1187,7 +1310,7 @@ struct ThreadLocalHandles {
       raw_sp1 = sp1_mem.get(true);
 
       s1_K = K_val;
-      s1_N = N_val;
+      s1_N = matmul_n_val;
       s1_sp_size = sp_size;
       initialized = true;
       last_a1_ptr = A_buf;
@@ -1211,11 +1334,11 @@ struct ThreadLocalHandles {
   }
 
   void ensure_stage2(dnnl::engine& eng, int64_t BLOCK_M_val, int64_t IC_val,
-                     int64_t N_val, const dnnl::memory::desc& sp_md,
+                     int64_t matmul_n_val, const dnnl::memory::desc& sp_md,
                      void* A_buf, int32_t* C_buf) {
     using namespace dnnl;
     size_t sp_size = sp_md.get_size();
-    if (s2_IC != IC_val || s2_N != N_val || s2_sp_size != sp_size) {
+    if (s2_IC != IC_val || s2_N != matmul_n_val || s2_sp_size != sp_size) {
       if (!initialized) {
         stream = dnnl::stream(eng);
         raw_stream = stream.get();
@@ -1223,7 +1346,7 @@ struct ThreadLocalHandles {
       }
 
       memory::desc a_md({BLOCK_M_val, IC_val}, memory::data_type::u8, memory::format_tag::ab);
-      memory::desc c_md({BLOCK_M_val, N_val}, memory::data_type::s32, memory::format_tag::ab);
+      memory::desc c_md({BLOCK_M_val, matmul_n_val}, memory::data_type::s32, memory::format_tag::ab);
       a2_mem = memory(a_md, eng, A_buf);
       c2_mem = memory(c_md, eng, C_buf);
       raw_a2 = a2_mem.get();
@@ -1235,7 +1358,7 @@ struct ThreadLocalHandles {
       raw_sp2 = sp2_mem.get(true);
 
       s2_IC = IC_val;
-      s2_N = N_val;
+      s2_N = matmul_n_val;
       s2_sp_size = sp_size;
       last_a2_ptr = A_buf;
       last_c2_ptr = C_buf;
@@ -1305,29 +1428,37 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_e = 2 * N * packed_K;
   const int64_t stride_n = packed_K;
 
+  // Compute wide block parameters
+  // actual_matmul_n: the width of the wide matmul, clamped to N if N < MATMUL_N
+  const int64_t actual_matmul_n = std::min(MATMUL_N, N);
+  TORCH_CHECK(actual_matmul_n % BLOCK_N == 0, "MATMUL_N must be multiple of BLOCK_N");
+  const int64_t sub_per_wide = actual_matmul_n / BLOCK_N;
+  const int64_t NB_wide = div_up(N, actual_matmul_n);
+
   auto& eng = get_onednn_engine();
 
-  // Build flat lookup tables
+  // Build wide flat lookup tables
   auto& ftc = FlatTableCache::instance();
   const auto& w1_table = ftc.get_w1_table(
-      packed_w1, E, NB, K, BLOCK_N, BLOCK_M, stride_e, stride_n);
+      packed_w1, E, NB, NB_wide, K, BLOCK_N, actual_matmul_n, BLOCK_M,
+      stride_e, stride_n, N);
   const auto* const* w1_lut = w1_table.data();
-  const int64_t w1_stride = 2 * NB;  // entries per expert in w1 table
+  const int64_t w1_stride = 2 * NB_wide;  // entries per expert in w1 table
 
   // Get a sample entry for scratchpad desc
   const auto* sample = w1_lut[0];
 
   // ---- Stage 1: silu(hidden_states @ w1) using parallel_2d + loop_2d ----
-  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+  parallel_2d(MB, NB_wide, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
-    int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * BLOCK_N;
-    int32_t* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
+    int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * actual_matmul_n;
+    int32_t* __restrict__ C1 = C0 + BLOCK_M * actual_matmul_n;
 
     alignas(64) float As[BLOCK_M];
 
     auto& th = get_thread_handles();
-    th.ensure_stage1(eng, BLOCK_M, K, BLOCK_N, sample->scratchpad_md, A, C0, C1);
+    th.ensure_stage1(eng, BLOCK_M, K, actual_matmul_n, sample->scratchpad_md, A, C0, C1);
 
     dnnl_exec_arg_t exec_args0[] = {
         {DNNL_ARG_SRC, th.raw_a1},
@@ -1345,10 +1476,7 @@ void fused_experts_int8_kernel_impl(
 
     int64_t last_mb = -1;
 
-    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-      int64_t nb_upper = nb, nb_lower = nb + NB;
-      int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
-
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, actual_matmul_n * K * 2, [&](int64_t mb, int64_t nbw, int64_t nb_offset) {
       int32_t expert_id = expert_ids[mb];
       int64_t m_size = offsets[mb + 1] - offsets[mb];
 
@@ -1366,27 +1494,38 @@ void fused_experts_int8_kernel_impl(
         last_mb = mb;
       }
 
-      // Gate matmul: C0 = A @ B0, [BLOCK_M, K] × [K, BLOCK_N] → [BLOCK_M, BLOCK_N]
-      const auto* entry0 = w1_lut[expert_id * w1_stride + nb_upper];
+      // Number of BLOCK_N sub-blocks in this wide block (may be fewer at the end)
+      int64_t first_nb = nbw * sub_per_wide;
+      int64_t num_sub = std::min(sub_per_wide, NB - first_nb);
+      int64_t wide_n = num_sub * BLOCK_N;
+
+      // Gate matmul: C0 = A @ B0_wide, [BLOCK_M, K] × [K, wide_n] → [BLOCK_M, wide_n]
+      const auto* entry0 = w1_lut[expert_id * w1_stride + nbw];
       exec_args0[1].memory = entry0->raw_weight;
       dnnl_primitive_execute(entry0->raw_primitive, raw_s, 4, exec_args0);
 
-      // Up matmul: C1 = A @ B1
-      const auto* entry1 = w1_lut[expert_id * w1_stride + nb_lower];
+      // Up matmul: C1 = A @ B1_wide
+      const auto* entry1 = w1_lut[expert_id * w1_stride + NB_wide + nbw];
       exec_args1[1].memory = entry1->raw_weight;
       dnnl_primitive_execute(entry1->raw_primitive, raw_s, 4, exec_args1);
 
-      // Dequantize + silu_and_mul
-      const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb_upper * BLOCK_N;
-      const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb_lower * BLOCK_N;
-      const int8_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
-      const int8_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n;
-      const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + BLOCK_N * K);
-      const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + BLOCK_N * K);
-
+      // Dequantize + silu_and_mul for each BLOCK_N sub-block within the wide output
       const int64_t offset = offsets[mb];
-      silu_and_mul<scalar_t, BLOCK_N>(
-          ic1 + offset * N + nb * BLOCK_N, C0, C1, As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N);
+      for (int64_t s = 0; s < num_sub; ++s) {
+        int64_t nb = first_nb + s;
+        const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb * BLOCK_N;
+        const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + (NB + nb) * BLOCK_N;
+        const int8_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
+        const int8_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + (NB + nb) * BLOCK_N * stride_n;
+        const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + BLOCK_N * K);
+        const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + BLOCK_N * K);
+
+        // Read from wide C0/C1 at sub-block offset, write to ic1
+        silu_and_mul_strided<scalar_t, BLOCK_N>(
+            ic1 + offset * N + nb * BLOCK_N,
+            C0, s * BLOCK_N, C1, s * BLOCK_N,
+            As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N, actual_matmul_n);
+      }
     });
   });
 
@@ -1396,6 +1535,16 @@ void fused_experts_int8_kernel_impl(
       quantize_row_int8<scalar_t>(Aq_tmp + m * N, As_tmp[m], ic1 + m * N, N);
     }
   });
+  // Zero-fill padding rows after valid data so oneDNN matmul reads zeros
+  // (oneDNN reads BLOCK_M rows but only m_size are valid)
+  {
+    int64_t pad_start = M * topk;
+    int64_t pad_end = pad_start + BLOCK_M;
+    std::memset(Aq_tmp + pad_start * N, 0, BLOCK_M * N);
+    for (int64_t m = pad_start; m < pad_end; ++m) {
+      As_tmp[m] = 0.0f;
+    }
+  }
 
   // ---- Stage 2: intermediate_cache2 = intermediate_cache1 @ w2 ----
   const int64_t OC = K;
@@ -1404,19 +1553,24 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_e2 = OC * packed_N;
   const int64_t stride_oc = packed_N;
 
+  const int64_t actual_matmul_n2 = std::min(MATMUL_N, OC);
+  const int64_t sub_per_wide2 = actual_matmul_n2 / BLOCK_N;
+  const int64_t NB2_wide = div_up(OC, actual_matmul_n2);
+
   const auto& w2_table = ftc.get_w2_table(
-      packed_w2, E, NB2, IC, BLOCK_N, BLOCK_M, stride_e2, stride_oc);
+      packed_w2, E, NB2, NB2_wide, IC, BLOCK_N, actual_matmul_n2, BLOCK_M,
+      stride_e2, stride_oc, OC);
   const auto* const* w2_lut = w2_table.data();
 
   const auto* sample2 = w2_lut[0];
 
-  parallel_2d(MB, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+  parallel_2d(MB, NB2_wide, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
-    float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
-    int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
+    float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * actual_matmul_n2;
+    int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * actual_matmul_n2);
 
     auto& th = get_thread_handles();
-    th.ensure_stage2(eng, BLOCK_M, IC, BLOCK_N, sample2->scratchpad_md, nullptr, C32);
+    th.ensure_stage2(eng, BLOCK_M, IC, actual_matmul_n2, sample2->scratchpad_md, nullptr, C32);
 
     dnnl_exec_arg_t exec_args[] = {
         {DNNL_ARG_SRC, th.raw_a2},
@@ -1426,9 +1580,8 @@ void fused_experts_int8_kernel_impl(
     };
     dnnl_stream_t raw_s = th.raw_stream;
 
-    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, actual_matmul_n2 * IC, [&](int64_t mb, int64_t nbw, int64_t nb_offset) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
-      int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
 
       // A ptr from ic1 quantized, in sorted order
       const uint8_t* __restrict__ A = Aq_tmp + offsets[mb] * N;
@@ -1445,22 +1598,34 @@ void fused_experts_int8_kernel_impl(
       }
       exec_args[0].memory = th.raw_a2;
 
-      // Matmul: C32 = A @ B
-      const auto* entry = w2_lut[expert_id * NB2 + nb];
+      // Number of BLOCK_N sub-blocks in this wide block
+      int64_t first_nb = nbw * sub_per_wide2;
+      int64_t num_sub = std::min(sub_per_wide2, NB2 - first_nb);
+      int64_t wide_n = num_sub * BLOCK_N;
+
+      // Wide matmul: C32 = A @ B_wide
+      const auto* entry = w2_lut[expert_id * NB2_wide + nbw];
       exec_args[1].memory = entry->raw_weight;
       dnnl_primitive_execute(entry->raw_primitive, raw_s, 4, exec_args);
 
-      // Dequantize
-      const int8_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
-      const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
-      const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + BLOCK_N * IC);
-      scale_C<BLOCK_N>(C, C32, As, Bs, Bcomp, m_size);
+      // Dequantize + copy for each BLOCK_N sub-block
+      for (int64_t s = 0; s < num_sub; ++s) {
+        int64_t nb = first_nb + s;
+        int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
 
-      // Copy to ic2 with topk_weights
-      for (int64_t m = 0; m < m_size; ++m) {
-        int32_t index = A_ids[m];
-        float weight = topk_weights[index];
-        copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
+        const int8_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
+        const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
+        const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + BLOCK_N * IC);
+
+        // scale_C reads from C32 at sub-block offset, writes to C at sub-block offset
+        scale_C_strided<BLOCK_N>(C, s * BLOCK_N, C32, s * BLOCK_N, As, Bs, Bcomp, m_size, actual_matmul_n2);
+
+        // Copy to ic2 with topk_weights
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m];
+          float weight = topk_weights[index];
+          copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * actual_matmul_n2 + s * BLOCK_N, weight, n_size);
+        }
       }
     });
   });
