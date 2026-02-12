@@ -1157,6 +1157,110 @@ inline const OneDNNWeightCache::CacheEntry* get_or_create_wide_weight(
   return &it->second;
 }
 
+// Create a fused gate+up matmul: concatenate gate and up VNNI blocks side-by-side
+// into a single [K, 2*wide_n] matrix.
+//   gate_ptr points to the first gate VNNI sub-block
+//   up_ptr   points to the first up   VNNI sub-block
+//   num_sub VNNI sub-blocks per half, stride_n between sub-blocks
+// Output matmul: [BLOCK_M, K] × [K, 2*wide_n] → [BLOCK_M, 2*wide_n]
+// Columns [0, wide_n) = gate, columns [wide_n, 2*wide_n) = up
+inline const OneDNNWeightCache::CacheEntry* get_or_create_fused_gate_up_weight(
+    const int8_t* gate_ptr,
+    const int8_t* up_ptr,
+    int64_t K_dim,
+    int64_t BLOCK_N_sub,
+    int64_t num_sub,
+    int64_t stride_n,
+    int64_t BLOCK_M_dim) {
+  auto& cache = OneDNNWeightCache::instance();
+  // Unique key: use gate_ptr combined with a marker (bit 47 set) and num_sub in bits 48+
+  const void* key = reinterpret_cast<const void*>(
+      reinterpret_cast<uintptr_t>(gate_ptr) |
+      (1ULL << 47) |
+      (static_cast<uintptr_t>(num_sub) << 48));
+
+  {
+    auto it = cache.entries.find(key);
+    if (it != cache.entries.end()) {
+      return &it->second;
+    }
+  }
+
+  const int64_t half_N = BLOCK_N_sub * num_sub;
+  const int64_t fused_N = 2 * half_N;
+  auto& eng = get_onednn_engine();
+  dnnl::stream s(eng);
+
+  dnnl::memory::desc a_md({BLOCK_M_dim, K_dim}, dnnl::memory::data_type::u8, dnnl::memory::format_tag::ab);
+  dnnl::memory::desc b_user_md({K_dim, fused_N}, dnnl::memory::data_type::s8, dnnl::memory::format_tag::ab);
+  dnnl::memory::desc b_opt_md({K_dim, fused_N}, dnnl::memory::data_type::s8, dnnl::memory::format_tag::any);
+  dnnl::memory::desc c_md({BLOCK_M_dim, fused_N}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::ab);
+
+  dnnl::primitive_attr attr;
+  attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+
+  auto pd = dnnl::matmul::primitive_desc(eng, a_md, b_opt_md, c_md, attr);
+  auto prim = dnnl::matmul(pd);
+  auto sp_md = pd.scratchpad_desc();
+
+  // Unpack gate and up VNNI blocks into plain [K, 2*half_N]
+  // Columns [0, half_N) = gate, [half_N, 2*half_N) = up
+  std::vector<int8_t> unpacked(K_dim * fused_N, 0);
+  constexpr int VNNI_BLK = 4;
+  const int64_t K_groups = K_dim / VNNI_BLK;
+
+  // Gate half: columns [0, half_N)
+  for (int64_t s_idx = 0; s_idx < num_sub; ++s_idx) {
+    const int8_t* vnni = gate_ptr + s_idx * BLOCK_N_sub * stride_n;
+    const int64_t col_off = s_idx * BLOCK_N_sub;
+    for (int64_t kg = 0; kg < K_groups; ++kg) {
+      for (int64_t n = 0; n < BLOCK_N_sub; ++n) {
+        for (int64_t d = 0; d < VNNI_BLK; ++d) {
+          int64_t k = kg * VNNI_BLK + d;
+          unpacked[k * fused_N + col_off + n] =
+              vnni[kg * BLOCK_N_sub * VNNI_BLK + n * VNNI_BLK + d];
+        }
+      }
+    }
+  }
+  // Up half: columns [half_N, 2*half_N)
+  for (int64_t s_idx = 0; s_idx < num_sub; ++s_idx) {
+    const int8_t* vnni = up_ptr + s_idx * BLOCK_N_sub * stride_n;
+    const int64_t col_off = half_N + s_idx * BLOCK_N_sub;
+    for (int64_t kg = 0; kg < K_groups; ++kg) {
+      for (int64_t n = 0; n < BLOCK_N_sub; ++n) {
+        for (int64_t d = 0; d < VNNI_BLK; ++d) {
+          int64_t k = kg * VNNI_BLK + d;
+          unpacked[k * fused_N + col_off + n] =
+              vnni[kg * BLOCK_N_sub * VNNI_BLK + n * VNNI_BLK + d];
+        }
+      }
+    }
+  }
+
+  auto b_user_mem = dnnl::memory(b_user_md, eng, unpacked.data());
+  dnnl::memory b_reordered;
+  if (pd.weights_desc() != b_user_md) {
+    b_reordered = dnnl::memory(pd.weights_desc(), eng);
+    dnnl::reorder(b_user_mem, b_reordered).execute(s, b_user_mem, b_reordered);
+    s.wait();
+  } else {
+    b_reordered = dnnl::memory(b_user_md, eng);
+    std::memcpy(b_reordered.get_data_handle(), unpacked.data(), K_dim * fused_N);
+  }
+
+  dnnl_memory_t raw_w = b_reordered.get();
+  dnnl_primitive_t raw_p = prim.get();
+
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto [it, inserted] = cache.entries.emplace(
+      key,
+      OneDNNWeightCache::CacheEntry{
+          std::move(b_reordered), raw_w, raw_p,
+          std::move(pd), std::move(prim), std::move(sp_md)});
+  return &it->second;
+}
+
 // ---- Flat lookup table: entries[expert * NB_wide + nb_wide] ----
 // Each entry points to a wide matmul CacheEntry covering MATMUL_N columns.
 struct FlatTableCache {
@@ -1229,6 +1333,42 @@ struct FlatTableCache {
     return it->second.entries;
   }
 
+  // Build fused gate+up flat table for w1: entries[e * NB_wide + nbw]
+  // Each entry is a fused [K, 2*wide_n] matmul covering gate and up together.
+  // Output columns: [0, wide_n) = gate, [wide_n, 2*wide_n) = up.
+  const std::vector<const OneDNNWeightCache::CacheEntry*>& get_w1_fused_table(
+      const int8_t* packed_w1, int64_t E, int64_t NB, int64_t NB_wide,
+      int64_t K, int64_t BLOCK_N_val, int64_t matmul_n, int64_t BLOCK_M,
+      int64_t stride_e, int64_t stride_n, int64_t N) {
+    const int64_t total = E * NB_wide;
+    // Use a distinct key by adding 3 to matmul_n to avoid collision with separate tables
+    TableKey key{packed_w1, total, matmul_n + 3};
+    {
+      auto it = tables.find(key);
+      if (it != tables.end()) return it->second.entries;
+    }
+
+    const int64_t sub_per_wide = matmul_n / BLOCK_N_val;
+    std::vector<const OneDNNWeightCache::CacheEntry*> entries(total);
+    for (int64_t e = 0; e < E; ++e) {
+      for (int64_t nbw = 0; nbw < NB_wide; ++nbw) {
+        int64_t first_nb = nbw * sub_per_wide;
+        int64_t remaining = NB - first_nb;
+        int64_t num_sub = std::min(sub_per_wide, remaining);
+        // Gate pointer: half=0
+        const int8_t* gate_ptr = packed_w1 + e * stride_e + first_nb * BLOCK_N_val * stride_n;
+        // Up pointer: half=1 (offset by NB sub-blocks)
+        const int8_t* up_ptr = packed_w1 + e * stride_e + (NB + first_nb) * BLOCK_N_val * stride_n;
+        entries[e * NB_wide + nbw] =
+            get_or_create_fused_gate_up_weight(gate_ptr, up_ptr, K, BLOCK_N_val, num_sub, stride_n, BLOCK_M);
+      }
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto [it, _] = tables.emplace(key, Table{std::move(entries)});
+    return it->second.entries;
+  }
+
   // Build wide flat table for w2: entries[e * NB2_wide + nb_wide]
   const std::vector<const OneDNNWeightCache::CacheEntry*>& get_w2_table(
       const int8_t* packed_w2, int64_t E, int64_t NB2, int64_t NB2_wide,
@@ -1265,9 +1405,9 @@ struct ThreadLocalHandles {
   dnnl::stream stream;
   dnnl_stream_t raw_stream = nullptr;
 
-  // Stage 1 handles: [BLOCK_M, K] × [K, matmul_n] → [BLOCK_M, matmul_n]
-  dnnl::memory a1_mem, c1_0_mem, c1_1_mem, sp1_mem;
-  dnnl_memory_t raw_a1 = nullptr, raw_c1_0 = nullptr, raw_c1_1 = nullptr, raw_sp1 = nullptr;
+  // Stage 1 fused gate+up: [BLOCK_M, K] × [K, 2*matmul_n] → [BLOCK_M, 2*matmul_n]
+  dnnl::memory a1_mem, c1_fused_mem, sp1_mem;
+  dnnl_memory_t raw_a1 = nullptr, raw_c1_fused = nullptr, raw_sp1 = nullptr;
 
   // Stage 2 handles: [BLOCK_M, IC] × [IC, matmul_n] → [BLOCK_M, matmul_n]
   dnnl::memory a2_mem, c2_mem, sp2_mem;
@@ -1281,28 +1421,27 @@ struct ThreadLocalHandles {
 
   // Pointer tracking to skip redundant set_data_handle
   void* last_a1_ptr = nullptr;
-  void* last_c1_0_ptr = nullptr;
-  void* last_c1_1_ptr = nullptr;
+  void* last_c1_fused_ptr = nullptr;
   void* last_a2_ptr = nullptr;
   void* last_c2_ptr = nullptr;
 
+  // Stage 1: fused gate+up output is [BLOCK_M, 2*matmul_n] s32
   void ensure_stage1(dnnl::engine& eng, int64_t BLOCK_M_val, int64_t K_val,
                      int64_t matmul_n_val, const dnnl::memory::desc& sp_md,
-                     void* A_buf, int32_t* C0_buf, int32_t* C1_buf) {
+                     void* A_buf, int32_t* C_fused_buf) {
     using namespace dnnl;
+    const int64_t fused_n = 2 * matmul_n_val;
     size_t sp_size = sp_md.get_size();
     if (!initialized || s1_K != K_val || s1_N != matmul_n_val || s1_sp_size != sp_size) {
       stream = dnnl::stream(eng);
       raw_stream = stream.get();
 
       memory::desc a_md({BLOCK_M_val, K_val}, memory::data_type::u8, memory::format_tag::ab);
-      memory::desc c_md({BLOCK_M_val, matmul_n_val}, memory::data_type::s32, memory::format_tag::ab);
+      memory::desc c_md({BLOCK_M_val, fused_n}, memory::data_type::s32, memory::format_tag::ab);
       a1_mem = memory(a_md, eng, A_buf);
-      c1_0_mem = memory(c_md, eng, C0_buf);
-      c1_1_mem = memory(c_md, eng, C1_buf);
+      c1_fused_mem = memory(c_md, eng, C_fused_buf);
       raw_a1 = a1_mem.get();
-      raw_c1_0 = c1_0_mem.get();
-      raw_c1_1 = c1_1_mem.get();
+      raw_c1_fused = c1_fused_mem.get();
 
       if (sp_size > 0) {
         sp1_mem = memory(sp_md, eng);
@@ -1314,21 +1453,16 @@ struct ThreadLocalHandles {
       s1_sp_size = sp_size;
       initialized = true;
       last_a1_ptr = A_buf;
-      last_c1_0_ptr = C0_buf;
-      last_c1_1_ptr = C1_buf;
+      last_c1_fused_ptr = C_fused_buf;
     } else {
       // Shape unchanged but buffers may have moved (new allocation)
       if (A_buf != last_a1_ptr) {
         dnnl_memory_set_data_handle(raw_a1, A_buf);
         last_a1_ptr = A_buf;
       }
-      if (C0_buf != last_c1_0_ptr) {
-        dnnl_memory_set_data_handle(raw_c1_0, C0_buf);
-        last_c1_0_ptr = C0_buf;
-      }
-      if (C1_buf != last_c1_1_ptr) {
-        dnnl_memory_set_data_handle(raw_c1_1, C1_buf);
-        last_c1_1_ptr = C1_buf;
+      if (C_fused_buf != last_c1_fused_ptr) {
+        dnnl_memory_set_data_handle(raw_c1_fused, C_fused_buf);
+        last_c1_fused_ptr = C_fused_buf;
       }
     }
   }
@@ -1432,51 +1566,48 @@ void fused_experts_int8_kernel_impl(
   // actual_matmul_n: the width of the wide matmul, clamped to N if N < MATMUL_N
   const int64_t actual_matmul_n = std::min(MATMUL_N, N);
   TORCH_CHECK(actual_matmul_n % BLOCK_N == 0, "MATMUL_N must be multiple of BLOCK_N");
+  TORCH_CHECK(N % actual_matmul_n == 0, "N must be multiple of actual_matmul_n for fused gate+up");
   const int64_t sub_per_wide = actual_matmul_n / BLOCK_N;
-  const int64_t NB_wide = div_up(N, actual_matmul_n);
+  const int64_t NB_wide = N / actual_matmul_n;
 
   auto& eng = get_onednn_engine();
 
   // Build wide flat lookup tables
   auto& ftc = FlatTableCache::instance();
-  const auto& w1_table = ftc.get_w1_table(
+  const auto& w1_table = ftc.get_w1_fused_table(
       packed_w1, E, NB, NB_wide, K, BLOCK_N, actual_matmul_n, BLOCK_M,
       stride_e, stride_n, N);
   const auto* const* w1_lut = w1_table.data();
-  const int64_t w1_stride = 2 * NB_wide;  // entries per expert in w1 table
 
   // Get a sample entry for scratchpad desc
   const auto* sample = w1_lut[0];
 
-  // ---- Stage 1: silu(hidden_states @ w1) using parallel_2d + loop_2d ----
+  // ---- Stage 1: fused gate+up matmul → silu_and_mul ----
+  // One matmul per (mb, nbw): [BLOCK_M, K] × [K, 2*wide_n] → [BLOCK_M, 2*wide_n]
+  // Output columns: [0, wide_n) = gate, [wide_n, 2*wide_n) = up
+  const int64_t fused_matmul_n = 2 * actual_matmul_n;  // output width of fused matmul
   parallel_2d(MB, NB_wide, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
-    int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * actual_matmul_n;
-    int32_t* __restrict__ C1 = C0 + BLOCK_M * actual_matmul_n;
+    // Fused C buffer: [BLOCK_M, 2*actual_matmul_n] s32
+    int32_t* __restrict__ C_fused = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * actual_matmul_n;
 
     alignas(64) float As[BLOCK_M];
 
     auto& th = get_thread_handles();
-    th.ensure_stage1(eng, BLOCK_M, K, actual_matmul_n, sample->scratchpad_md, A, C0, C1);
+    th.ensure_stage1(eng, BLOCK_M, K, actual_matmul_n, sample->scratchpad_md, A, C_fused);
 
-    dnnl_exec_arg_t exec_args0[] = {
+    dnnl_exec_arg_t exec_args[] = {
         {DNNL_ARG_SRC, th.raw_a1},
         {DNNL_ARG_WEIGHTS, nullptr},
-        {DNNL_ARG_DST, th.raw_c1_0},
-        {DNNL_ARG_SCRATCHPAD, th.raw_sp1}
-    };
-    dnnl_exec_arg_t exec_args1[] = {
-        {DNNL_ARG_SRC, th.raw_a1},
-        {DNNL_ARG_WEIGHTS, nullptr},
-        {DNNL_ARG_DST, th.raw_c1_1},
+        {DNNL_ARG_DST, th.raw_c1_fused},
         {DNNL_ARG_SCRATCHPAD, th.raw_sp1}
     };
     dnnl_stream_t raw_s = th.raw_stream;
 
     int64_t last_mb = -1;
 
-    loop_2d<int8_t>(mb0, mb1, nb0, nb1, actual_matmul_n * K * 2, [&](int64_t mb, int64_t nbw, int64_t nb_offset) {
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, fused_matmul_n * K, [&](int64_t mb, int64_t nbw, int64_t nb_offset) {
       int32_t expert_id = expert_ids[mb];
       int64_t m_size = offsets[mb + 1] - offsets[mb];
 
@@ -1499,17 +1630,14 @@ void fused_experts_int8_kernel_impl(
       int64_t num_sub = std::min(sub_per_wide, NB - first_nb);
       int64_t wide_n = num_sub * BLOCK_N;
 
-      // Gate matmul: C0 = A @ B0_wide, [BLOCK_M, K] × [K, wide_n] → [BLOCK_M, wide_n]
-      const auto* entry0 = w1_lut[expert_id * w1_stride + nbw];
-      exec_args0[1].memory = entry0->raw_weight;
-      dnnl_primitive_execute(entry0->raw_primitive, raw_s, 4, exec_args0);
+      // Fused gate+up matmul: C_fused = A @ [B_gate | B_up]
+      // [BLOCK_M, K] × [K, 2*wide_n] → [BLOCK_M, 2*wide_n]
+      const auto* entry = w1_lut[expert_id * NB_wide + nbw];
+      exec_args[1].memory = entry->raw_weight;
+      dnnl_primitive_execute(entry->raw_primitive, raw_s, 4, exec_args);
 
-      // Up matmul: C1 = A @ B1_wide
-      const auto* entry1 = w1_lut[expert_id * w1_stride + NB_wide + nbw];
-      exec_args1[1].memory = entry1->raw_weight;
-      dnnl_primitive_execute(entry1->raw_primitive, raw_s, 4, exec_args1);
-
-      // Dequantize + silu_and_mul for each BLOCK_N sub-block within the wide output
+      // Dequantize + silu_and_mul for each BLOCK_N sub-block
+      // C_fused layout: columns [0, wide_n) = gate, [wide_n, 2*wide_n) = up
       const int64_t offset = offsets[mb];
       for (int64_t s = 0; s < num_sub; ++s) {
         int64_t nb = first_nb + s;
@@ -1520,11 +1648,13 @@ void fused_experts_int8_kernel_impl(
         const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + BLOCK_N * K);
         const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + BLOCK_N * K);
 
-        // Read from wide C0/C1 at sub-block offset, write to ic1
+        // Gate: col offset = s * BLOCK_N (in first half)
+        // Up:   col offset = wide_n + s * BLOCK_N (in second half)
+        // ldc = 2 * wide_n (fused row width)
         silu_and_mul_strided<scalar_t, BLOCK_N>(
             ic1 + offset * N + nb * BLOCK_N,
-            C0, s * BLOCK_N, C1, s * BLOCK_N,
-            As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N, actual_matmul_n);
+            C_fused, s * BLOCK_N, C_fused, wide_n + s * BLOCK_N,
+            As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N, fused_matmul_n);
       }
     });
   });
