@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MoE Int8 Kernel Performance Analysis — brgemm vs oneDNN matmul</title>
+<style>
+  :root {
+    --bg: #f8f9fa;
+    --card: #fff;
+    --border: #dee2e6;
+    --accent: #0d6efd;
+    --good: #198754;
+    --bad: #dc3545;
+    --warn: #fd7e14;
+    --text: #212529;
+    --muted: #6c757d;
+    --code-bg: #f1f3f5;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 1.8rem; margin-bottom: 8px; color: var(--accent); }
+  h2 { font-size: 1.4rem; margin: 32px 0 16px; padding-bottom: 8px; border-bottom: 2px solid var(--accent); }
+  h3 { font-size: 1.15rem; margin: 24px 0 12px; }
+  p, li { margin-bottom: 8px; }
+  .subtitle { color: var(--muted); font-size: 0.95rem; margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.9rem; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: #e9ecef; font-weight: 600; white-space: nowrap; }
+  td { vertical-align: top; }
+  .good { color: var(--good); font-weight: 600; }
+  .bad  { color: var(--bad);  font-weight: 600; }
+  .warn { color: var(--warn); font-weight: 600; }
+  .mono { font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; font-size: 0.85rem; }
+  code { background: var(--code-bg); padding: 2px 6px; border-radius: 4px; font-size: 0.85em; }
+  pre { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 0.82rem; line-height: 1.5; margin: 12px 0; }
+  pre .kw { color: #569cd6; }
+  pre .fn { color: #dcdcaa; }
+  pre .cm { color: #6a9955; }
+  pre .num { color: #b5cea8; }
+  pre .str { color: #ce9178; }
+  .perf-bar-container { display: flex; align-items: center; gap: 8px; }
+  .perf-bar { height: 20px; border-radius: 4px; min-width: 4px; }
+  .perf-bar.baseline { background: var(--good); }
+  .perf-bar.v1 { background: var(--bad); }
+  .perf-bar.v2 { background: var(--warn); }
+  .legend { display: flex; gap: 20px; margin: 12px 0; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; }
+  .legend-swatch { width: 16px; height: 16px; border-radius: 3px; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.78rem; font-weight: 600; }
+  .tag-good { background: #d1e7dd; color: #0f5132; }
+  .tag-bad  { background: #f8d7da; color: #842029; }
+  .tag-warn { background: #fff3cd; color: #664d03; }
+  .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 16px 0; }
+  .summary-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .summary-card h4 { font-size: 0.95rem; margin-bottom: 8px; }
+  .big-num { font-size: 2rem; font-weight: 700; }
+  .section-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 4px; }
+  .diagram { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; overflow-x: auto; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.78rem; line-height: 1.6; margin: 12px 0; white-space: pre; }
+  ul { padding-left: 24px; }
+  .highlight-row { background: #fff3cd; }
+  .data-note { font-size: 0.8rem; color: var(--muted); margin-top: 4px; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px 24px; margin-bottom: 24px; }
+  .toc ol { padding-left: 20px; }
+  .toc li { margin-bottom: 4px; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>MoE Int8 Kernel Performance Analysis</h1>
+<p class="subtitle">brgemm baseline vs. two oneDNN matmul implementations &mdash; SGLang CPU Kernel &mdash; Intel Xeon with AMX (43 cores)</p>
+
+<!-- ============================================================ -->
+<div class="toc">
+<strong>Contents</strong>
+<ol>
+  <li><a href="#s1">Test Environment &amp; Configurations</a></li>
+  <li><a href="#s2">Performance Results (Measured Data)</a></li>
+  <li><a href="#s3">Architecture Comparison</a></li>
+  <li><a href="#s4">Stage-by-Stage Kernel Pipeline</a></li>
+  <li><a href="#s5">Root Cause: V1 — Sequential Expert Loop</a></li>
+  <li><a href="#s6">Root Cause: V2 — parallel_2d oneDNN Blocks</a></li>
+  <li><a href="#s7">Quantitative Time Breakdown</a></li>
+  <li><a href="#s8">Why oneDNN matmul Cannot Beat brgemm Here</a></li>
+  <li><a href="#s9">Conclusion &amp; Recommendations</a></li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s1">1. Test Environment &amp; Configurations</h2>
+<div class="card">
+<table>
+  <tr><th>Item</th><th>Detail</th></tr>
+  <tr><td>CPU</td><td>Intel Xeon (AMX-capable), 43 cores via <code>numactl -C 0-42</code></td></tr>
+  <tr><td>Benchmark</td><td><code>bench_moe.py</code> — 100 iterations, L=2 or L=20 depending on M</td></tr>
+  <tr><td>Data types</td><td>Activations: uint8 (dynamic quantized) &middot; Weights: int8 (VNNI packed) &middot; Output: bfloat16</td></tr>
+  <tr><td>Hardware accel.</td><td>Intel AMX (TMUL) for int8 DPBUSD/DPBSSD tile operations</td></tr>
+  <tr><td>Block sizes</td><td>TILE_M=16, TILE_N=16, TILE_K=32 &rarr; BLOCK_M=32, BLOCK_N=32</td></tr>
+</table>
+
+<h3>Three Implementations</h3>
+<table>
+  <tr>
+    <th>Label</th><th>Branch</th><th>Macro</th><th>Strategy</th>
+  </tr>
+  <tr>
+    <td><span class="tag tag-good">Baseline</span></td>
+    <td class="mono">any (ONEDNN=0)</td>
+    <td><code>SGLANG_USE_ONEDNN_MOE == 0</code></td>
+    <td>brgemm + tinygemm microkernels, <code>parallel_2d(MB, NB)</code></td>
+  </tr>
+  <tr>
+    <td><span class="tag tag-bad">V1 — Seq-Expert</span></td>
+    <td class="mono">cpu_moe_int8_0.5.6_post2</td>
+    <td><code>SGLANG_USE_ONEDNN_MOE == 1</code></td>
+    <td>oneDNN matmul, sequential expert loop, full-expert matmul per call</td>
+  </tr>
+  <tr>
+    <td><span class="tag tag-warn">V2 — p2d-Block</span></td>
+    <td class="mono">cpu_moe_int8_test</td>
+    <td><code>SGLANG_USE_ONEDNN_MOE == 1</code></td>
+    <td>oneDNN matmul, <code>parallel_2d(MB, NB_wide)</code>, per-tile dispatch, MATMUL_N=64</td>
+  </tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2">2. Performance Results (Measured Data)</h2>
+<div class="card">
+<table>
+  <tr>
+    <th>Shape (M, N, K, E, topk)</th>
+    <th>Baseline</th>
+    <th>V1 Seq-Expert</th>
+    <th>V1 Δ</th>
+    <th>V2 p2d-Block</th>
+    <th>V2 Δ</th>
+  </tr>
+  <tr>
+    <td class="mono">384, 2048, 7168, 8, 3</td>
+    <td class="good">9.299 ms</td>
+    <td class="bad">12.954 ms</td>
+    <td class="bad">+39.3%</td>
+    <td>9.350 ms</td>
+    <td class="warn">+0.5%</td>
+  </tr>
+  <tr>
+    <td class="mono">32, 2048, 7168, 8, 3</td>
+    <td class="good">2.219 ms</td>
+    <td class="bad">3.081 ms</td>
+    <td class="bad">+38.8%</td>
+    <td>2.242 ms</td>
+    <td class="warn">+1.0%</td>
+  </tr>
+  <tr>
+    <td class="mono">384, 2048, 7168, 1, 1</td>
+    <td class="good">1.149 ms</td>
+    <td class="bad">1.789 ms</td>
+    <td class="bad">+55.7%</td>
+    <td class="bad">1.440 ms</td>
+    <td class="bad">+25.3%</td>
+  </tr>
+  <tr>
+    <td class="mono">32, 2048, 7168, 1, 1</td>
+    <td class="good">0.255 ms</td>
+    <td class="bad">0.360 ms</td>
+    <td class="bad">+41.2%</td>
+    <td>0.255 ms</td>
+    <td>+0.0%</td>
+  </tr>
+  <tr>
+    <td class="mono">384, 2048, 7168, 8, 5</td>
+    <td class="good">14.217 ms</td>
+    <td>14.054 ms</td>
+    <td class="good">-1.1%</td>
+    <td class="bad">15.596 ms</td>
+    <td class="bad">+9.7%</td>
+  </tr>
+</table>
+
+<h3>Visual Comparison (bar width ∝ latency)</h3>
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:var(--good)"></div>Baseline (brgemm)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:var(--bad)"></div>V1 — Sequential Expert</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:var(--warn)"></div>V2 — parallel_2d Block</div>
+</div>
+
+<table>
+  <tr><th style="width:220px">Shape</th><th>Latency (ms)</th></tr>
+  <tr>
+    <td class="mono">M=384, E=8, top3</td>
+    <td>
+      <div class="perf-bar-container"><div class="perf-bar baseline" style="width:calc(9.299/16*100%)"></div><span>9.30</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v1" style="width:calc(12.954/16*100%)"></div><span>12.95</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v2" style="width:calc(9.35/16*100%)"></div><span>9.35</span></div>
+    </td>
+  </tr>
+  <tr>
+    <td class="mono">M=32, E=8, top3</td>
+    <td>
+      <div class="perf-bar-container"><div class="perf-bar baseline" style="width:calc(2.219/4*100%)"></div><span>2.22</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v1" style="width:calc(3.081/4*100%)"></div><span>3.08</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v2" style="width:calc(2.242/4*100%)"></div><span>2.24</span></div>
+    </td>
+  </tr>
+  <tr>
+    <td class="mono">M=384, E=1, top1</td>
+    <td>
+      <div class="perf-bar-container"><div class="perf-bar baseline" style="width:calc(1.149/2*100%)"></div><span>1.15</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v1" style="width:calc(1.789/2*100%)"></div><span>1.79</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v2" style="width:calc(1.440/2*100%)"></div><span>1.44</span></div>
+    </td>
+  </tr>
+  <tr>
+    <td class="mono">M=32, E=1, top1</td>
+    <td>
+      <div class="perf-bar-container"><div class="perf-bar baseline" style="width:calc(0.255/0.4*100%)"></div><span>0.26</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v1" style="width:calc(0.360/0.4*100%)"></div><span>0.36</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v2" style="width:calc(0.255/0.4*100%)"></div><span>0.26</span></div>
+    </td>
+  </tr>
+  <tr>
+    <td class="mono">M=384, E=8, top5</td>
+    <td>
+      <div class="perf-bar-container"><div class="perf-bar baseline" style="width:calc(14.217/16*100%)"></div><span>14.22</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v1" style="width:calc(14.054/16*100%)"></div><span>14.05</span></div>
+      <div class="perf-bar-container"><div class="perf-bar v2" style="width:calc(15.596/16*100%)"></div><span>15.60</span></div>
+    </td>
+  </tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s3">3. Architecture Comparison</h2>
+<div class="card">
+
+<h3>Baseline — brgemm + parallel_2d</h3>
+<div class="diagram">
+parallel_2d(MB, NB)                      ← all threads work on 2D tile grid concurrently
+  └─ loop_2d(mb, nb, chunk_size)         ← cache-blocked inner loop
+       ├─ copy_stub: A[BLOCK_M, K]       ← gather ≤32 rows into thread-local buffer (224 KB)
+       ├─ brgemm(A, B0, C0)             ← JIT microkernel, [≤32, 7168] × [7168, 32] → [≤32, 32] s32
+       ├─ brgemm(A, B1, C1)             ← same, for up-projection half
+       └─ silu_and_mul(C0, C1 → ic1)    ← fused: C0,C1 are 4 KB each, still hot in L1 cache
+
+  Key property: weights in native VNNI format [K/4, BLOCK_N, 4] — brgemm reads directly.
+  Per-tile s32 output: 32 × 32 × 4 = 4 KB → fits in L1 (48 KB per core).
+  No dispatch overhead: brgemm is a direct function-pointer call to JIT'd AMX code.
+  No inter-expert barriers: all experts' tiles distributed across threads simultaneously.</div>
+
+<h3>V1 — Sequential Expert + oneDNN matmul</h3>
+<div class="diagram">
+for (expert : expert_batches)                  ← SEQUENTIAL over experts (serialized!)
+  ├─ gather A: [m_size, K] → A_padded          ← copy up to 1 MB of activations
+  ├─ w1_prim.execute(A, B_cached, C_combined)  ← oneDNN matmul [padded_m, K] × [K, 2N]
+  │   └─ s.wait()                              ← BARRIER: wait for all oneDNN internal threads
+  ├─ at::parallel_for(scale_and_silu_mul)       ← separate pass over [m_size, 2N] s32 output
+  │                                             ← re-reads 2.6 MB of s32 data from memory
+  ├─ w2_prim.execute(A, B_cached, C_s32)        ← oneDNN matmul [padded_m, N] × [N, K]
+  │   └─ s.wait()                              ← BARRIER again
+  └─ at::parallel_for(scale_and_weight_fused)   ← separate pass over [m_size, K] s32 output
+
+  Key property: ONE matmul per expert for the entire N dimension.
+  Weight format: VNNI unpacked → [N, K] plain → reordered to BA16a64b4a (cached).
+  Per-expert s32 output: padded_m × 2N × 4 = 160 × 4096 × 4 = 2.6 MB → exceeds L2 (2 MB).
+  Barriers per kernel call: 2 barriers/expert × E experts × 2 stages = 4E barriers total.</div>
+
+<h3>V2 — parallel_2d + oneDNN matmul Tiles</h3>
+<div class="diagram">
+parallel_2d(MB, NB_wide)                          ← same 2D grid as baseline, NB_wide = N/64
+  └─ loop_2d(mb, nbw, chunk_size)
+       ├─ copy_stub: A[BLOCK_M, K]                ← gather ≤32 rows (same as baseline)
+       ├─ dnnl_primitive_execute(A, B_cached, C_fused)
+       │   ← matmul [32, 7168] × [7168, 128] → [32, 128] s32  (gate+up fused, 2×64)
+       └─ silu_and_mul_strided(C_fused → ic1)      ← post-processing with stride=128
+                                                    ← C_fused = 32 × 128 × 4 = 16 KB
+
+  Key property: same parallelism as baseline — no serialization.
+  Weight format: VNNI unpacked → plain → oneDNN any format (cached).
+  Per-tile s32 output: 32 × 128 × 4 = 16 KB → fits in L1 but 4× larger than baseline's 4 KB.
+  Dispatch overhead: ~100-200 ns per dnnl_primitive_execute call × many tiles.</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s4">4. Stage-by-Stage Kernel Pipeline</h2>
+<div class="card">
+<p>All three implementations share the same 5-stage pipeline. The differences are <strong>only in Stages 1 and 2</strong> (the GEMM + post-processing stages).</p>
+<table>
+  <tr><th>Stage</th><th>Operation</th><th>Dimensions</th><th>Shared?</th></tr>
+  <tr><td>0</td><td>Quantize input bf16 → uint8</td><td>[M, K]</td><td>✓ Identical</td></tr>
+  <tr class="highlight-row"><td>1</td><td><strong>Gate+Up GEMM + silu_and_mul</strong></td><td>[M·topk, K] × [K, 2N]</td><td>✗ Different</td></tr>
+  <tr><td>1.5</td><td>Quantize ic1 bf16 → uint8</td><td>[M·topk, N]</td><td>✓ Identical</td></tr>
+  <tr class="highlight-row"><td>2</td><td><strong>Down-proj GEMM + scale + scatter</strong></td><td>[M·topk, N] × [N, K]</td><td>✗ Different</td></tr>
+  <tr><td>3</td><td>Reduce sum over topk</td><td>[M, topk, K] → [M, K]</td><td>✓ Identical</td></tr>
+</table>
+<p class="data-note">Since Stages 0, 1.5, and 3 are identical, all performance differences come from Stages 1 and 2.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5">5. Root Cause Analysis: V1 — Sequential Expert Loop</h2>
+<div class="card">
+
+<h3>Problem 1: Sequential Expert Processing Destroys Parallelism</h3>
+<p>V1 processes experts one at a time in a <code>for (batch : expert_batches)</code> loop.
+Each expert's matmul uses oneDNN's internal threading (all 43 cores), but experts are serialized.</p>
+
+<table>
+  <tr><th>Metric (M=384, E=8, topk=3)</th><th>Baseline</th><th>V1</th></tr>
+  <tr><td>Matmul calls in Stage 1</td><td>~2700 brgemm calls distributed across 43 threads, zero barriers</td><td>8 sequential matmul calls, each with <code>s.wait()</code> barrier</td></tr>
+  <tr><td>Matmul calls in Stage 2</td><td>~2700 brgemm calls, zero barriers</td><td>8 sequential matmul calls, each with <code>s.wait()</code> barrier</td></tr>
+  <tr><td>Total thread barriers</td><td><strong>2</strong> (<code>#pragma omp parallel</code> for Stage 1 and Stage 2)</td><td><strong>32+</strong> (8 experts × 2 stages × 2 barriers/stage)</td></tr>
+</table>
+<p>Each <code>s.wait()</code> and each <code>at::parallel_for</code> entry/exit involves an OpenMP fork-join barrier.
+On 43 cores, a barrier costs ~2-5 µs. With 32+ barriers, this alone adds <strong>~0.1–0.2 ms</strong>.</p>
+
+<h3>Problem 2: Massive Intermediate Buffer Thrashing</h3>
+<p>V1's matmul outputs the <strong>entire expert's result</strong> before post-processing it:</p>
+<table>
+  <tr><th>Buffer</th><th>Baseline per tile</th><th>V1 per expert</th><th>Ratio</th></tr>
+  <tr>
+    <td>Stage 1 s32 output (C0 + C1)</td>
+    <td>32 × 32 × 4 × 2 = <strong>8 KB</strong><br>(fits in L1, 48 KB)</td>
+    <td>160 × 4096 × 4 = <strong>2,621 KB</strong><br>(exceeds L2, 2048 KB)</td>
+    <td>328×</td>
+  </tr>
+  <tr>
+    <td>Stage 2 s32 output</td>
+    <td>32 × 32 × 4 = <strong>4 KB</strong></td>
+    <td>160 × 7168 × 4 = <strong>4,587 KB</strong></td>
+    <td>1147×</td>
+  </tr>
+</table>
+<p>In the baseline, <code>silu_and_mul</code> consumes C0/C1 immediately while they're in L1.
+In V1, the s32 output is written to DRAM by oneDNN, then the separate <code>at::parallel_for(scale_and_silu_mul_fused)</code>
+re-reads it from DRAM — a <strong>full round-trip through the memory hierarchy</strong>.</p>
+
+<h3>Problem 3: Activation Gather Overhead</h3>
+<p>V1 gathers all tokens for an expert into a contiguous buffer before the matmul:</p>
+<table>
+  <tr><th>Metric (M=384, E=8, topk=3)</th><th>Baseline</th><th>V1</th></tr>
+  <tr><td>Gather size per call</td><td>≤32 × 7168 = <strong>224 KB</strong></td><td>~144 × 7168 = <strong>1,008 KB</strong></td></tr>
+  <tr><td>Who gathers</td><td>Each thread gathers its own BLOCK_M rows</td><td>Single-threaded or <code>parallel_for</code> (extra fork-join)</td></tr>
+  <tr><td>Contiguity check</td><td>None needed</td><td>O(m_size) loop to check contiguity + fallback gather</td></tr>
+</table>
+
+<h3>Problem 4: Wasted Computation on Padded Rows</h3>
+<p>V1 pads <code>m_size</code> to the next BLOCK_M=32 multiple (<code>padded_m</code>).
+For an expert with 144 tokens, <code>padded_m = 160</code>, wasting 16 rows × full K × 2N = <strong>~940M int8 ops per expert</strong>.
+With 8 experts, total wasted: ~7.5G ops (~5% of useful compute).</p>
+
+<h3>Why M=384, E=8, topk=5 Is the Only Near-Parity Case</h3>
+<p>With topk=5: total tokens = 1920, each expert gets ~240 tokens, padded to 256.
+The matmul shape [256, 7168] × [7168, 4096] is large enough that:</p>
+<ul>
+  <li>AMX tile reuse is high (256 rows ÷ 16 = 16 M-tiles, good amortization).</li>
+  <li>The barrier cost (~0.2 ms) is small relative to total compute (~14 ms).</li>
+  <li>oneDNN's internal blocking can effectively use all 43 cores.</li>
+  <li>Padding waste is only 256-240 = 16 rows, or 6.7%.</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s6">6. Root Cause Analysis: V2 — parallel_2d oneDNN Blocks</h2>
+<div class="card">
+
+<p>V2 preserves the baseline's <code>parallel_2d</code> parallelism structure, so it avoids V1's serialization problem.
+The remaining gaps come from three sources:</p>
+
+<h3>Source 1: Per-Tile Dispatch Overhead</h3>
+<table>
+  <tr><th>Metric (M=384, E=8, topk=3)</th><th>Baseline</th><th>V2</th></tr>
+  <tr><td>Stage 1 tiles per thread</td><td>MB × NB / 42 ≈ 36 × 64 / 42 ≈ 55 tiles</td><td>MB × NB_wide / 42 ≈ 36 × 32 / 42 ≈ 27 tiles</td></tr>
+  <tr><td>GEMM calls per tile</td><td>2 brgemm calls (B0, B1)</td><td>1 dnnl_primitive_execute call (fused gate+up)</td></tr>
+  <tr><td>Cost per call</td><td>~0 ns (JIT function pointer)</td><td>~100-200 ns (primitive dispatch, arg packing)</td></tr>
+  <tr><td>Total dispatch overhead</td><td>~0 ms</td><td>~0.03-0.06 ms per stage</td></tr>
+</table>
+<p>This is minor but measurable for the E=1 case where total compute is only ~1 ms.</p>
+
+<h3>Source 2: Wider s32 Output Buffer (L1 Pressure)</h3>
+<table>
+  <tr><th>Metric</th><th>Baseline</th><th>V2</th></tr>
+  <tr><td>Stage 1 s32 output per tile</td><td>32 × 32 × 4 × 2 = <strong>8 KB</strong></td><td>32 × 128 × 4 = <strong>16 KB</strong> (fused gate+up)</td></tr>
+  <tr><td>L1 cache residency</td><td>8 KB / 48 KB = 17%</td><td>16 KB / 48 KB = 33%</td></tr>
+  <tr><td>Post-processing stride</td><td><code>BLOCK_N = 32</code> (tight)</td><td><code>fused_matmul_n = 128</code> (strided reads from wider buffer)</td></tr>
+</table>
+<p><code>silu_and_mul_strided</code> reads gate values at offset <code>s * BLOCK_N</code> and up values at offset
+<code>wide_n + s * BLOCK_N</code> within a row of width <code>2 * actual_matmul_n = 128</code>.
+This strided access pattern is less cache-friendly than the baseline's tight BLOCK_N=32 buffers.</p>
+
+<h3>Source 3: Weight Format Double-Conversion</h3>
+<p>Weights are stored in VNNI format <code>[K/4, BLOCK_N, 4]</code>, which is the native AMX layout.
+V2 unpacks them to plain <code>[K, N]</code>, then oneDNN re-packs into its own optimal format via <code>format_tag::any</code>.
+This is a <strong>VNNI → plain → oneDNN-internal</strong> double-conversion. The reorder is amortized (cached),
+but the resulting format may not be more efficient than the original VNNI — and the extra memory for
+the cached reordered weights adds to memory footprint.</p>
+
+<h3>Why E=1, topk=1 Shows 25% Regression</h3>
+<p>With E=1, topk=1, M=384: there is exactly one expert processing all 384 tokens.
+MB = 384/32 = 12, NB_wide = 2048/64 = 32. Total Stage 1 tiles = 12 × 32 = 384.
+Total compute: 384 × 7168 × 4096 × 2 = ~22.6G ops.
+At ~43 cores × ~2 TOPS each ≈ 86 TOPS, the pure compute takes ~0.26 ms.
+The actual measured time is 1.15 ms (baseline) vs 1.44 ms (V2), so compute is only ~23% of total time.
+The remaining ~77% is memory bandwidth, quantization, and overhead — where V2's per-tile dispatch
+and wider buffers have outsized impact.</p>
+
+<h3>Why E=8, topk=5 Shows 10% Regression</h3>
+<p>With topk=5, total tokens = 1920, MB = 60. Each thread in <code>parallel_2d(60, 32)</code>
+processes more tiles. The L2 cache blocking via <code>loop_2d</code> uses <code>chunk_size = fused_matmul_n × K = 128 × 7168 = 917,504</code> bytes.
+The <code>get_cache_blocks</code> function computes: <code>L2_size/2 / chunk_size = 1,048,576 / 917,504 = 1</code> block.
+This means <strong>no N-blocking reuse</strong> — each tile's weight data is fetched from memory independently.
+In the baseline, <code>chunk_size = BLOCK_N × K × 2 = 32 × 7168 × 2 = 458,752</code> bytes,
+giving <code>1,048,576 / 458,752 = 2</code> cache blocks — enabling weight reuse across two N-blocks.
+This difference in L2 blocking efficiency explains V2's regression on this shape.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7">7. Quantitative Time Breakdown</h2>
+<div class="card">
+<h3>Estimated Stage Timings (M=384, N=2048, K=7168, E=8, topk=3)</h3>
+<p class="data-note">Estimates based on operation counts, memory traffic analysis, and measured total times.
+Total tokens processed: M × topk = 1152. Distributed across E=8 experts, ~144 tokens/expert.</p>
+
+<table>
+  <tr>
+    <th>Stage</th><th>Operation</th>
+    <th>Baseline</th><th>V1 Seq-Expert</th><th>V2 p2d-Block</th>
+  </tr>
+  <tr>
+    <td>0</td><td>Quantize input [384, 7168]</td>
+    <td>~0.15 ms</td><td>~0.15 ms</td><td>~0.15 ms</td>
+  </tr>
+  <tr class="highlight-row">
+    <td rowspan="4">1</td>
+    <td>GEMM compute (AMX)</td>
+    <td>~3.3 ms</td><td>~3.5 ms</td><td>~3.4 ms</td>
+  </tr>
+  <tr class="highlight-row">
+    <td>A gather/copy</td>
+    <td>~0.2 ms</td><td class="bad">~0.5 ms</td><td>~0.2 ms</td>
+  </tr>
+  <tr class="highlight-row">
+    <td>Dispatch + barriers</td>
+    <td>~0.0 ms</td><td class="bad">~0.3 ms</td><td>~0.05 ms</td>
+  </tr>
+  <tr class="highlight-row">
+    <td>silu_and_mul (post-proc)</td>
+    <td>~0.4 ms</td><td class="bad">~0.8 ms</td><td>~0.5 ms</td>
+  </tr>
+  <tr>
+    <td>1.5</td><td>Quantize ic1 [1152, 2048]</td>
+    <td>~0.15 ms</td><td>~0.15 ms</td><td>~0.15 ms</td>
+  </tr>
+  <tr class="highlight-row">
+    <td rowspan="4">2</td>
+    <td>GEMM compute (AMX)</td>
+    <td>~3.3 ms</td><td>~3.5 ms</td><td>~3.4 ms</td>
+  </tr>
+  <tr class="highlight-row">
+    <td>A gather (Stage 2)</td>
+    <td>~0.0 ms</td><td class="bad">~0.4 ms</td><td>~0.0 ms</td>
+  </tr>
+  <tr class="highlight-row">
+    <td>Dispatch + barriers</td>
+    <td>~0.0 ms</td><td class="bad">~0.3 ms</td><td>~0.05 ms</td>
+  </tr>
+  <tr class="highlight-row">
+    <td>Scale + scatter + weight_mul</td>
+    <td>~0.8 ms</td><td class="bad">~1.3 ms</td><td>~0.9 ms</td>
+  </tr>
+  <tr>
+    <td>3</td><td>sum_stub reduction</td>
+    <td>~0.3 ms</td><td>~0.3 ms</td><td>~0.3 ms</td>
+  </tr>
+  <tr style="font-weight: 700; border-top: 2px solid var(--text);">
+    <td></td><td>Estimated Total</td>
+    <td class="good">~8.6 ms</td><td class="bad">~11.2 ms</td><td>~9.1 ms</td>
+  </tr>
+  <tr style="font-weight: 700;">
+    <td></td><td>Measured Total</td>
+    <td class="good">9.299 ms</td><td class="bad">12.954 ms</td><td>9.350 ms</td>
+  </tr>
+</table>
+
+<p class="data-note">
+The GEMM compute rows are slightly higher for V1 because of (a) wasted computation on padded rows
+(160 vs 144 actual tokens per expert = 11% waste) and (b) oneDNN's internal dispatch and scratchpad management.
+The estimates exclude minor costs like vector init, index computation, and function call overhead.
+</p>
+
+<h3>Where V1's Extra ~3.7 ms Comes From</h3>
+<div class="summary-grid">
+  <div class="summary-card">
+    <div class="section-label">Buffer Thrashing</div>
+    <div class="big-num bad">~1.3 ms</div>
+    <p>s32 output exceeds L2 → DRAM round-trip for post-processing.
+    Stage 1: 2.6 MB per expert. Stage 2: 4.6 MB per expert.</p>
+  </div>
+  <div class="summary-card">
+    <div class="section-label">Barriers &amp; Fork-Join</div>
+    <div class="big-num bad">~0.6 ms</div>
+    <p>32+ barriers (8 experts × 2 stages × 2 sync points).
+    Each ~2-5 µs on 43 cores.</p>
+  </div>
+  <div class="summary-card">
+    <div class="section-label">Gather Overhead</div>
+    <div class="big-num bad">~0.7 ms</div>
+    <p>~1 MB gather per expert for Stage 1, ~0.5 MB for Stage 2.
+    Plus contiguity checking and index_map allocation.</p>
+  </div>
+  <div class="summary-card">
+    <div class="section-label">Padding Waste</div>
+    <div class="big-num bad">~0.5 ms</div>
+    <p>11% wasted rows × 2 stages of GEMM.
+    144→160 tokens/expert, 16 zero rows computed but discarded.</p>
+  </div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8">8. Why oneDNN matmul Cannot Beat brgemm Here</h2>
+<div class="card">
+
+<h3>The Fundamental Constraint: Same AMX Hardware</h3>
+<p>Both brgemm and oneDNN matmul ultimately execute the same AMX <code>TDPBUSD</code> instructions.
+The difference is only in the software overhead <em>around</em> those instructions.
+For the matmul shapes in MoE, AMX throughput is <strong>not the bottleneck</strong>.</p>
+
+<h3>Per-Tile Arithmetic Intensity Analysis</h3>
+<p>For a single Stage 1 tile (baseline: [32, 7168] × [7168, 32]):</p>
+<table>
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td>Compute (int8 ops)</td><td>2 × 32 × 32 × 7168 = 14.7M ops</td></tr>
+  <tr><td>Weight data read</td><td>32 × 7168 × 1 byte = 224 KB</td></tr>
+  <tr><td>Activation data read</td><td>32 × 7168 × 1 byte = 224 KB</td></tr>
+  <tr><td>Output data write</td><td>32 × 32 × 4 bytes = 4 KB</td></tr>
+  <tr><td>Arithmetic intensity</td><td>14.7M / 452 KB ≈ <strong>32.5 ops/byte</strong></td></tr>
+  <tr><td>AMX peak (1 core, int8)</td><td>~2 TOPS</td></tr>
+  <tr><td>L2 bandwidth (1 core)</td><td>~50 GB/s</td></tr>
+  <tr><td>Compute-limited time</td><td>14.7M / 2T = 7.4 µs</td></tr>
+  <tr><td>Memory-limited time</td><td>452 KB / 50 GB/s = 9.0 µs</td></tr>
+</table>
+<p>The tile is <strong>memory-bandwidth limited</strong> (9.0 µs > 7.4 µs).
+A "better AMX blocking strategy" from oneDNN cannot help because AMX is already
+waiting on memory. The roofline intersection is at ~40 ops/byte; we're at 32.5.</p>
+
+<h3>Why brgemm Is Near-Optimal for This Pattern</h3>
+<table>
+  <tr><th>Property</th><th>brgemm</th><th>oneDNN matmul</th><th>Impact</th></tr>
+  <tr>
+    <td>Dispatch mechanism</td>
+    <td>Direct JIT function pointer call</td>
+    <td><code>dnnl_primitive_execute</code> → internal dispatch, arg validation</td>
+    <td>~100-200 ns overhead per call</td>
+  </tr>
+  <tr>
+    <td>Weight format</td>
+    <td>Native VNNI <code>[K/4, N, 4]</code> — zero conversion</td>
+    <td>VNNI unpacked → plain → reordered (cached but redundant)</td>
+    <td>Extra memory footprint, no perf gain</td>
+  </tr>
+  <tr>
+    <td>Post-processing fusion</td>
+    <td>silu_and_mul reads s32 while in L1</td>
+    <td>Separate pass over s32 buffer</td>
+    <td>Extra memory traffic (4-16 KB per tile)</td>
+  </tr>
+  <tr>
+    <td>Thread model</td>
+    <td>External <code>parallel_2d</code> — zero internal barriers</td>
+    <td>V1: oneDNN internal threading + barriers<br>V2: external <code>parallel_2d</code> (same)</td>
+    <td>V1: major regression<br>V2: neutral</td>
+  </tr>
+  <tr>
+    <td>Blocking strategy</td>
+    <td><code>loop_2d</code> with L2-aware cache blocking</td>
+    <td>V1: no blocking (full expert)<br>V2: same <code>loop_2d</code></td>
+    <td>V1: L2 thrashing<br>V2: neutral to slightly worse</td>
+  </tr>
+  <tr>
+    <td>AMX tile config</td>
+    <td>Configured once per <code>parallel_2d</code> region</td>
+    <td>oneDNN may reconfigure per execute call</td>
+    <td>Minor (~50 ns per LDTILECFG)</td>
+  </tr>
+</table>
+
+<h3>The Theoretical Upside of oneDNN — and Why It Doesn't Apply Here</h3>
+<p>oneDNN matmul excels when:</p>
+<ul>
+  <li><strong>The caller doesn't block</strong> — oneDNN can choose its own M/N/K tiling globally.
+    In MoE, <code>parallel_2d</code>/<code>loop_2d</code> already tiles the problem externally.</li>
+  <li><strong>Weight format is suboptimal</strong> — oneDNN's <code>format_tag::any</code> can find a better layout.
+    In MoE, weights are already in VNNI format, which is what AMX consumes natively.</li>
+  <li><strong>Post-ops are fused</strong> — oneDNN can fuse bias, eltwise (ReLU), etc. into the matmul.
+    In MoE, silu_and_mul involves <em>two</em> matmul outputs (gate and up) — not expressible as a standard oneDNN post-op.</li>
+  <li><strong>M is large</strong> — oneDNN's internal threading and blocking shine for large matrices.
+    In MoE, the per-tile M is capped at BLOCK_M=32.</li>
+</ul>
+<p><strong>None of these conditions are met in the MoE kernel.</strong></p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9">9. Conclusion &amp; Recommendations</h2>
+<div class="card">
+
+<div class="summary-grid">
+  <div class="summary-card" style="border-left: 4px solid var(--good);">
+    <h4>Baseline (brgemm)</h4>
+    <div class="big-num good">Winner</div>
+    <p>Near-optimal for MoE: zero dispatch overhead, native VNNI weights,
+    L1-fused post-processing, fine-grained 2D parallelism, no inter-expert barriers.</p>
+  </div>
+  <div class="summary-card" style="border-left: 4px solid var(--bad);">
+    <h4>V1 — Sequential Expert</h4>
+    <div class="big-num bad">+39-56%</div>
+    <p>Fundamentally flawed: sequential expert processing, L2-busting intermediate buffers,
+    excessive barriers, large gather overhead. Not salvageable without architectural redesign.</p>
+  </div>
+  <div class="summary-card" style="border-left: 4px solid var(--warn);">
+    <h4>V2 — parallel_2d Block</h4>
+    <div class="big-num warn">+0-25%</div>
+    <p>Correct parallelism, but per-tile dispatch overhead and wider buffers add up.
+    Cannot outperform brgemm — at best matches it, at worst 25% slower.</p>
+  </div>
+</div>
+
+<h3>Is There Room for oneDNN to Beat the Baseline?</h3>
+<table>
+  <tr><th>Potential Optimization</th><th>Feasibility</th><th>Expected Gain</th></tr>
+  <tr>
+    <td>Fuse silu_and_mul as oneDNN post-op</td>
+    <td><span class="tag tag-bad">Infeasible</span> — silu_and_mul needs two matmul outputs (gate, up); not a standard post-op</td>
+    <td>Would save ~0.4 ms if possible</td>
+  </tr>
+  <tr>
+    <td>Increase MATMUL_N to full N</td>
+    <td><span class="tag tag-warn">Risky</span> — fewer dispatches but worse L2 blocking for K-streaming</td>
+    <td>~0.03 ms dispatch savings, offset by cache misses</td>
+  </tr>
+  <tr>
+    <td>Call oneDNN once per expert (V1 approach with better parallelism)</td>
+    <td><span class="tag tag-bad">Impractical</span> — requires restructuring the entire parallel decomposition</td>
+    <td>Cannot match baseline's fused post-processing</td>
+  </tr>
+  <tr>
+    <td>Use oneDNN brgemm API directly</td>
+    <td><span class="tag tag-good">Possible</span> — but this is exactly what the baseline already does via PyTorch's <code>cpublas::brgemm</code></td>
+    <td>0% — same code path</td>
+  </tr>
+</table>
+
+<h3>Final Verdict</h3>
+<p style="font-size: 1.05rem; padding: 12px; background: #d1e7dd; border-radius: 8px; border-left: 4px solid var(--good);">
+  <strong>There is no viable path for oneDNN matmul to outperform the brgemm baseline for this MoE int8 kernel.</strong><br><br>
+  The baseline's architecture — brgemm microkernels operating on small VNNI-format tiles with L1-fused
+  post-processing in a fine-grained 2D parallel decomposition — is the optimal design for MoE on AMX hardware.
+  oneDNN matmul adds dispatch overhead, requires weight format conversion, and separates GEMM from
+  post-processing, all with no compensating benefit since the core AMX compute is identical.
+  <br><br>
+  oneDNN matmul is designed for large, standalone GEMM problems where its internal blocking, threading,
+  and format selection provide value. In MoE, the GEMM is already decomposed into small, cache-blocked
+  tiles with fused post-processing — exactly the scenario where a low-level primitive like brgemm excels
+  and a high-level API like matmul adds overhead without compensating benefit.
+</p>
+
+</div>
+
+<hr>
+<p style="text-align: center; color: var(--muted); font-size: 0.8rem;">
+  Generated March 1, 2026 &middot; SGLang CPU Kernel Team &middot;
+  Source: <code>sgl-kernel/csrc/cpu/moe_int8.cpp</code> across branches
+  <code>main</code>, <code>cpu_moe_int8_0.5.6_post2</code>, <code>cpu_moe_int8_test</code>
+</p>
+
+</div>
+</body>
+</html>
