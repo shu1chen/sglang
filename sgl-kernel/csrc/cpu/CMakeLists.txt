@@ -27,6 +27,28 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# oneDNN (optional, for moe_int8_onednn.cpp)
+set(DNNL_ROOT "$ENV{DNNL_DIR}")
+if(NOT DNNL_ROOT)
+    set(DNNL_ROOT "$ENV{HOME}/oneDNN")
+endif()
+set(DNNL_BUILD "$ENV{DNNL_BUILD}")
+if(NOT DNNL_BUILD)
+    set(DNNL_BUILD "${DNNL_ROOT}/build")
+endif()
+
+if(EXISTS "${DNNL_ROOT}/include/oneapi/dnnl/dnnl.hpp")
+    set(USE_ONEDNN ON)
+    message(STATUS "oneDNN found at: ${DNNL_ROOT}")
+    include_directories(${DNNL_ROOT}/include ${DNNL_BUILD}/include)
+    link_directories(${DNNL_BUILD}/src)
+    find_library(DNNL_LIB dnnl HINTS "${DNNL_BUILD}/src")
+    add_compile_definitions(SGL_USE_ONEDNN)
+else()
+    set(USE_ONEDNN OFF)
+    message(STATUS "oneDNN not found, skipping moe_int8_onednn.cpp")
+endif()
+
 # Platform-specific library directory
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(PLAT_LIB_DIR "/usr/lib/x86_64-linux-gnu")
@@ -92,7 +114,14 @@ add_compile_options(
 )
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+if(NOT USE_ONEDNN)
+    list(FILTER SOURCES EXCLUDE REGEX "moe_int8_onednn\\.cpp$")
+endif()
+
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
+if(USE_ONEDNN AND DNNL_LIB)
+    target_link_libraries(common_ops PRIVATE ${DNNL_LIB})
+endif()
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
 install(TARGETS common_ops
