@@ -115,7 +115,7 @@ add_compile_options(
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 if(NOT USE_ONEDNN)
-    list(FILTER SOURCES EXCLUDE REGEX "moe_int8_onednn\\.cpp$")
+    list(FILTER SOURCES EXCLUDE REGEX "(moe_int8_matmul|moe_int8_shared_expert_onednn)\\.cpp$")
 endif()
 
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})

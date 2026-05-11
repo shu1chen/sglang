@@ -183,6 +183,16 @@ at::Tensor fused_experts_onednn_cpu(
     at::Tensor& topk_ids,
     const at::Tensor& w1_scale,
     const at::Tensor& w2_scale);
+
+// shared expert (onednn)
+at::Tensor shared_expert_onednn_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& fused_experts_out,
+    double routed_scaling_factor,
+    const at::Tensor& w1_scale,
+    const at::Tensor& w2_scale);
 #endif
 
 // fused moe
@@ -455,6 +465,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_experts_onednn_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, "
       "Tensor w1_scale, Tensor w2_scale) -> Tensor");
   m.impl("fused_experts_onednn_cpu", torch::kCPU, &fused_experts_onednn_cpu);
+
+  // shared expert (onednn)
+  m.def(
+      "shared_expert_onednn_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor fused_experts_out, "
+      "float routed_scaling_factor, Tensor w1_scale, Tensor w2_scale) -> Tensor");
+  m.impl("shared_expert_onednn_cpu", torch::kCPU, &shared_expert_onednn_cpu);
 #endif
   // weight absorption
   m.def(
