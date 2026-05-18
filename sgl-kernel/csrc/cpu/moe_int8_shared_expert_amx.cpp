@@ -55,6 +55,10 @@ limitations under the License.
 
 #if defined(__x86_64__) || defined(_M_X64)
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
 #include <immintrin.h>
 #include <list>
 #include <mutex>
@@ -66,6 +70,64 @@ limitations under the License.
 #include "vec.h"
 
 namespace {
+
+// ------------- Optional per-stage timing -------------
+// Set SHARED_EXPERT_AMX_TIMING=1 to enable. Prints a summary every
+// SHARED_EXPERT_AMX_TIMING_PRINT (default 500) calls.
+struct Timing {
+  bool enabled = false;
+  int64_t print_every = 500;
+  std::atomic<int64_t> calls{0};
+  std::atomic<int64_t> ns_total{0};
+  std::atomic<int64_t> ns_s0{0};       // stage 0 (bf16->u8 quant)
+  std::atomic<int64_t> ns_s1_gemm{0};  // stage 1 gemm+silu*mul+amax
+  std::atomic<int64_t> ns_s1_reduce{0};// stage 1.5 amax reduce
+  std::atomic<int64_t> ns_s1_req{0};   // stage 1.5 requant
+  std::atomic<int64_t> ns_s2{0};       // stage 2 gemm+dequant+add+bf16 store
+  std::atomic<int64_t> ns_setup{0};    // setup (pool alloc, weight lookup, cfg)
+};
+
+static Timing& get_timing() {
+  static Timing t;
+  static bool inited = []{
+    const char* e = std::getenv("SHARED_EXPERT_AMX_TIMING");
+    t.enabled = (e && e[0] && e[0] != '0');
+    const char* p = std::getenv("SHARED_EXPERT_AMX_TIMING_PRINT");
+    if (p) {
+      long v = std::atol(p);
+      if (v > 0) t.print_every = v;
+    }
+    return true;
+  }();
+  (void)inited;
+  return t;
+}
+
+static inline int64_t now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void maybe_print_timing() {
+  auto& t = get_timing();
+  if (!t.enabled) return;
+  int64_t n = t.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n % t.print_every != 0) return;
+  double scale = 1e-3 / (double)t.print_every;  // ns -> us, averaged
+  int64_t total = t.ns_total.exchange(0);
+  int64_t s0 = t.ns_s0.exchange(0);
+  int64_t s1g = t.ns_s1_gemm.exchange(0);
+  int64_t s1r = t.ns_s1_reduce.exchange(0);
+  int64_t s1q = t.ns_s1_req.exchange(0);
+  int64_t s2 = t.ns_s2.exchange(0);
+  int64_t su = t.ns_setup.exchange(0);
+  std::fprintf(stderr,
+      "[shared_expert_amx] avg over %ld calls: "
+      "total=%.2fus setup=%.2f s0_quant=%.2f s1_gemm=%.2f s1_reduce=%.2f "
+      "s1_req=%.2f s2=%.2f\n",
+      (long)t.print_every, total*scale, su*scale, s0*scale,
+      s1g*scale, s1r*scale, s1q*scale, s2*scale);
+}
 
 // ------------- AMX tile configuration -------------
 
@@ -457,6 +519,11 @@ at::Tensor shared_expert_amx_impl(
   auto out_t = at::empty({M, K}, at::kBFloat16);
   at::BFloat16* outp = out_t.data_ptr<at::BFloat16>();
 
+  auto& _tm = get_timing();
+  const bool _timing = _tm.enabled;
+  int64_t _t_call_start = _timing ? now_ns() : 0;
+  int64_t _t_stage_start = _t_call_start;
+
   const int nth = omp_get_max_threads();
   {
     auto& ctx = get_ctx();
@@ -503,7 +570,13 @@ at::Tensor shared_expert_amx_impl(
   const __m512 vroute = _mm512_set1_ps(routed);
   (void)W1_NB;
 
-  #pragma omp parallel
+  // Per-stage wall-clock snapshots, written only by thread 0 just after each
+  // barrier. Variables declared before the parallel region are implicitly
+  // shared across threads.
+  int64_t _t_s0 = 0, _t_s1 = 0, _t_s1red = 0, _t_s1req = 0, _t_s2 = 0;
+  if (_timing) { _t_stage_start = now_ns(); _tm.ns_setup.fetch_add(_t_stage_start - _t_call_start, std::memory_order_relaxed); }
+
+  #pragma omp parallel shared(_t_s0, _t_s1, _t_s1red, _t_s1req, _t_s2)
   {
     const int tid = omp_get_thread_num();
     const int nthr = omp_get_num_threads();
@@ -559,6 +632,7 @@ at::Tensor shared_expert_amx_impl(
     for (int64_t m = 0; m < M; ++m) my_amax[m] = 0.f;
 
     #pragma omp barrier
+    if (_timing && tid == 0) _t_s0 = now_ns();
 
     // ---- Stage 1: W1 gemm + SiLU*Mul. Per-thread tracks partial per-row amax
     // over the nb-slice it owns.
@@ -632,6 +706,7 @@ at::Tensor shared_expert_amx_impl(
     }
 
     #pragma omp barrier
+    if (_timing && tid == 0) _t_s1 = now_ns();
 
     // ---- Stage 1.5: parallel reduction of per-thread amax -> intsc + inv.
     // Vectorized: process 16 rows at a time with AVX-512 max across threads.
@@ -655,6 +730,7 @@ at::Tensor shared_expert_amx_impl(
       _mm512_mask_storeu_ps(amax_tpr + m0, mk, inv);
     }
     #pragma omp barrier
+    if (_timing && tid == 0) _t_s1red = now_ns();
 
     // Column-parallel requant: same nb grid as Stage 1 -> warm L2 for this thread.
     #pragma omp for schedule(static) nowait
@@ -676,6 +752,7 @@ at::Tensor shared_expert_amx_impl(
     }
 
     #pragma omp barrier
+    if (_timing && tid == 0) _t_s1req = now_ns();
 
     // ---- Stage 2: W2 gemm + dequant + scaled add -> bf16 out.
     #pragma omp for schedule(static) nowait
@@ -720,7 +797,21 @@ at::Tensor shared_expert_amx_impl(
         }
       }
     }
+    // Implicit barrier at end of parallel captures stage 2 end time.
+    #pragma omp barrier
+    if (_timing && tid == 0) _t_s2 = now_ns();
     _tile_release();
+  }
+
+  if (_timing) {
+    int64_t t_end = now_ns();
+    _tm.ns_total.fetch_add(t_end - _t_call_start, std::memory_order_relaxed);
+    _tm.ns_s0.fetch_add(_t_s0 - _t_stage_start, std::memory_order_relaxed);
+    _tm.ns_s1_gemm.fetch_add(_t_s1 - _t_s0, std::memory_order_relaxed);
+    _tm.ns_s1_reduce.fetch_add(_t_s1red - _t_s1, std::memory_order_relaxed);
+    _tm.ns_s1_req.fetch_add(_t_s1req - _t_s1red, std::memory_order_relaxed);
+    _tm.ns_s2.fetch_add(_t_s2 - _t_s1req, std::memory_order_relaxed);
+    maybe_print_timing();
   }
 
   return out_t;
