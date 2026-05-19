@@ -248,6 +248,51 @@ static inline __m512 silu_ps(__m512 g) {
 }
 #endif
 
+// ------------- INT4 -> INT8 decode helper -------------
+//
+// Decode 32 packed int4 bytes (one VNNI K-iter row) into a 64-byte int8 tile
+// row. The packed layout per byte:
+//   bits[3:0] = even-K nibble (k0 within a col), bits[7:4] = odd-K nibble (k1).
+// For a 16-N-col VNNI row we have 16 cols × 2 packed bytes (k01, k23) = 32B in
+// → 16 cols × 4 K-bytes = 64B out.
+//
+// Decode equation: decoded_int8 = packed_nibble << 4 (sign-preserving when
+// nibble is interpreted as int4 in the high 4 bits of an int8). dpbusd then
+// computes A·(W*16); the post-process scale is multiplied by 16 to compensate.
+//
+// Layout in: bytes [c0_k01, c0_k23, c1_k01, c1_k23, ..., c15_k01, c15_k23]
+// Layout out: bytes [c0_k0, c0_k1, c0_k2, c0_k3, c1_k0, c1_k1, ..., c15_k3]
+static inline void decode_int4_to_int8_64B(
+    const int8_t* __restrict__ packed,  // 32 bytes
+    int8_t* __restrict__ out)           // 64 bytes (cache-line aligned)
+{
+  // Each packed byte holds 2 nibbles (low = even-K within a col,
+  // high = odd-K). Decoded int8 = nibble << 4 (sign-preserving when the
+  // 4-bit value is left-shifted into the high 4 bits of an int8).
+  __m256i p = _mm256_loadu_si256((const __m256i*)packed);
+  // lo_dec[i] = (low_nibble of packed[i]) << 4   = packed[i] << 4 (low 4 bits zero-fill, but masked).
+  //   _mm256_slli_epi16(p, 4) shifts each 16-bit element left 4 bits.
+  //   For element (byte_high, byte_low), result = (byte_high<<12 | byte_low<<4).
+  //   The low byte of result = byte_low << 4 (the low 4 bits of byte_low end up
+  //   in the high 4 bits of the byte, low 4 bits = 0). The high byte gets
+  //   contaminated by byte_low's high nibble; mask with 0xF0 to clean up.
+  __m256i mask = _mm256_set1_epi8((char)0xF0);
+  __m256i lo_dec = _mm256_and_si256(_mm256_slli_epi16(p, 4), mask);
+  // hi_dec[i] = high_nibble << 4 (already in high 4 bits, mask off low).
+  __m256i hi_dec = _mm256_and_si256(p, mask);
+  // Interleave per-byte to produce VNNI layout [k0,k1,k2,k3] for each col.
+  // unpacklo/hi work per 128-bit lane, so we get:
+  //   unpacklo: lane0 = packed[0..7] interleaved, lane1 = packed[16..23]
+  //   unpackhi: lane0 = packed[8..15] interleaved, lane1 = packed[24..31]
+  __m256i lo16 = _mm256_unpacklo_epi8(lo_dec, hi_dec);
+  __m256i hi16 = _mm256_unpackhi_epi8(lo_dec, hi_dec);
+  // Reassemble linear 64B output: [packed[0..7], packed[8..15], packed[16..23], packed[24..31]] decoded.
+  __m256i out_lo = _mm256_permute2x128_si256(lo16, hi16, 0x20);
+  __m256i out_hi = _mm256_permute2x128_si256(lo16, hi16, 0x31);
+  _mm256_storeu_si256((__m256i*)(out +  0), out_lo);
+  _mm256_storeu_si256((__m256i*)(out + 32), out_hi);
+}
+
 // ------------- Weight packing: s8 [K, N] row-major -> VNNI [N/16, K/4, 16, 4] -------------
 //
 // AMX INT8 B-tile expects 16 rows of (16 cols * 4 k-steps) = 1024 bytes.
@@ -293,12 +338,173 @@ static void pack_b_vnni_s8(
   }
 }
 
+// ------------- INT4 weight packing -------------
+//
+// Quantize int8 weight w to a 4-bit value q = clamp(round(w/16), -8, 7).
+// At dpbusd time, we restore via decode = q << 4 (back to int8 representation
+// in [-128, 112] step 16). The decode is lossy by design (this is the int4
+// quantization step). Bcomp uses the decoded values' sums so it stays
+// consistent with what AMX actually multiplies.
+//
+// Storage: 2 int4 values per byte (low nibble = even-K, high nibble = odd-K
+// within a VNNI 4-K-byte group). For each K-iter group of 4 K-rows × 16 N-cols
+// = 64 int8 bytes, we emit 32 packed bytes. So the int4 super-block is half
+// the size of the int8 super-block: K4 * 16 * 4 / 2 = K4 * 32 bytes per
+// 16-N-col sub-block.
+//
+// Layout per nb_32 (4 sub-blocks contiguous, same as int8 path but half size):
+//   offset 0:  Bg_lo (32B per K-iter row, K4 rows)  -- size K4*32
+//   offset 1:  Bg_hi
+//   offset 2:  Bu_lo
+//   offset 3:  Bu_hi
+static inline int8_t quant_i4(int8_t w) {
+  // round-to-nearest with ties-to-zero (sufficient for INT8->INT4 RTN quant).
+  int v = (int)w;
+  int q = (v + (v >= 0 ? 8 : -8)) / 16;
+  if (q < -8) q = -8;
+  if (q > 7) q = 7;
+  return (int8_t)q;
+}
+
+static void pack_w1_vnni_int4(
+    int8_t* __restrict__ dst, int32_t* __restrict__ bcomp,
+    const int8_t* __restrict__ w1_data,
+    int64_t K, int64_t N) {
+  // dst layout: NB32 super-blocks of 4 × (K4*32) bytes each.
+  // bcomp layout: matches int8 — gate cols 0..N-1, then up cols 0..N-1.
+  const int64_t NB32 = N / 32;
+  const int64_t K4 = K / 4;
+  const int64_t sub_bytes = K4 * 16 * 2;          // 16 cols × 4 K × 0.5 byte
+  const int64_t super_bytes = 4 * sub_bytes;
+  #pragma omp parallel for schedule(static)
+  for (int64_t nb32 = 0; nb32 < NB32; ++nb32) {
+    int8_t* sp_g_lo = dst + nb32 * super_bytes + 0 * sub_bytes;
+    int8_t* sp_g_hi = dst + nb32 * super_bytes + 1 * sub_bytes;
+    int8_t* sp_u_lo = dst + nb32 * super_bytes + 2 * sub_bytes;
+    int8_t* sp_u_hi = dst + nb32 * super_bytes + 3 * sub_bytes;
+    int32_t sum_g_lo[16] = {0};
+    int32_t sum_g_hi[16] = {0};
+    int32_t sum_u_lo[16] = {0};
+    int32_t sum_u_hi[16] = {0};
+    const int g_base = (int)(nb32 * 32);
+    const int u_base = (int)(N + nb32 * 32);
+    for (int64_t k4 = 0; k4 < K4; ++k4) {
+      const int8_t* row0 = w1_data + (k4 * 4 + 0) * (2 * N);
+      const int8_t* row1 = w1_data + (k4 * 4 + 1) * (2 * N);
+      const int8_t* row2 = w1_data + (k4 * 4 + 2) * (2 * N);
+      const int8_t* row3 = w1_data + (k4 * 4 + 3) * (2 * N);
+      // Per K-iter row: emit 16 N × 4 K = 64 int8s = 32 packed bytes.
+      // VNNI byte order within the 4-K group: [k0, k1, k2, k3] for col 0,
+      // then col 1, etc. Pack pairs (k0,k1) and (k2,k3) into adjacent
+      // bytes — actually we pack per-N-col: 4 K-bytes per col → 2 packed
+      // bytes per col. So 32 packed bytes per K-iter row.
+      int64_t off = k4 * (16 * 2);  // 32 bytes per K-iter row
+      auto emit_sub = [&](int col_base, int8_t* sp, int32_t* sum) {
+        for (int n = 0; n < 16; ++n) {
+          int col = col_base + n;
+          int8_t q0 = quant_i4(row0[col]);
+          int8_t q1 = quant_i4(row1[col]);
+          int8_t q2 = quant_i4(row2[col]);
+          int8_t q3 = quant_i4(row3[col]);
+          // Pack: byte0 = q0 | (q1 << 4), byte1 = q2 | (q3 << 4).
+          // Each nibble holds the int4 value's bit pattern (low 4 bits).
+          uint8_t b0 = (uint8_t)(((uint8_t)q0 & 0x0F) | (((uint8_t)q1 & 0x0F) << 4));
+          uint8_t b1 = (uint8_t)(((uint8_t)q2 & 0x0F) | (((uint8_t)q3 & 0x0F) << 4));
+          sp[off + n * 2 + 0] = (int8_t)b0;
+          sp[off + n * 2 + 1] = (int8_t)b1;
+          // Bcomp = 128 * sum(decoded). decoded = q << 4.
+          sum[n] += ((int32_t)q0 + (int32_t)q1 + (int32_t)q2 + (int32_t)q3) << 4;
+        }
+      };
+      emit_sub(g_base,      sp_g_lo, sum_g_lo);
+      emit_sub(g_base + 16, sp_g_hi, sum_g_hi);
+      emit_sub(u_base,      sp_u_lo, sum_u_lo);
+      emit_sub(u_base + 16, sp_u_hi, sum_u_hi);
+    }
+    for (int n = 0; n < 16; ++n) {
+      bcomp[nb32 * 32 + n]      = 128 * sum_g_lo[n];
+      bcomp[nb32 * 32 + 16 + n] = 128 * sum_g_hi[n];
+      bcomp[N + nb32 * 32 + n]      = 128 * sum_u_lo[n];
+      bcomp[N + nb32 * 32 + 16 + n] = 128 * sum_u_hi[n];
+    }
+  }
+}
+
+// INT8 W1 packer with the same contiguous-super-block layout (4 sub-blocks
+// per nb_32 super: Bg_lo, Bg_hi, Bu_lo, Bu_hi). Used when the env-var
+// SHARED_EXPERT_AMX_INT4 is unset/0 — keeps the existing accuracy/perf
+// baseline available alongside the int4 path for A/B comparison.
+static void pack_w1_vnni_int8(
+    int8_t* __restrict__ dst, int32_t* __restrict__ bcomp,
+    const int8_t* __restrict__ w1_data,
+    int64_t K, int64_t N) {
+  const int64_t NB32 = N / 32;
+  const int64_t K4 = K / 4;
+  const int64_t sub_bytes = K4 * 16 * 4;       // 16 cols × 4 K × 1 byte
+  const int64_t super_bytes = 4 * sub_bytes;
+  #pragma omp parallel for schedule(static)
+  for (int64_t nb32 = 0; nb32 < NB32; ++nb32) {
+    int8_t* sp_g_lo = dst + nb32 * super_bytes + 0 * sub_bytes;
+    int8_t* sp_g_hi = dst + nb32 * super_bytes + 1 * sub_bytes;
+    int8_t* sp_u_lo = dst + nb32 * super_bytes + 2 * sub_bytes;
+    int8_t* sp_u_hi = dst + nb32 * super_bytes + 3 * sub_bytes;
+    int32_t sum_g_lo[16] = {0};
+    int32_t sum_g_hi[16] = {0};
+    int32_t sum_u_lo[16] = {0};
+    int32_t sum_u_hi[16] = {0};
+    const int g_base = (int)(nb32 * 32);
+    const int u_base = (int)(N + nb32 * 32);
+    for (int64_t k4 = 0; k4 < K4; ++k4) {
+      const int8_t* row0 = w1_data + (k4 * 4 + 0) * (2 * N);
+      const int8_t* row1 = w1_data + (k4 * 4 + 1) * (2 * N);
+      const int8_t* row2 = w1_data + (k4 * 4 + 2) * (2 * N);
+      const int8_t* row3 = w1_data + (k4 * 4 + 3) * (2 * N);
+      int64_t off = k4 * (16 * 4);
+      auto emit_sub = [&](int col_base, int8_t* sp, int32_t* sum) {
+        for (int n = 0; n < 16; ++n) {
+          int col = col_base + n;
+          int8_t s0 = row0[col], s1 = row1[col], s2 = row2[col], s3 = row3[col];
+          sp[off + n * 4 + 0] = s0;
+          sp[off + n * 4 + 1] = s1;
+          sp[off + n * 4 + 2] = s2;
+          sp[off + n * 4 + 3] = s3;
+          sum[n] += (int32_t)s0 + (int32_t)s1 + (int32_t)s2 + (int32_t)s3;
+        }
+      };
+      emit_sub(g_base,      sp_g_lo, sum_g_lo);
+      emit_sub(g_base + 16, sp_g_hi, sum_g_hi);
+      emit_sub(u_base,      sp_u_lo, sum_u_lo);
+      emit_sub(u_base + 16, sp_u_hi, sum_u_hi);
+    }
+    for (int n = 0; n < 16; ++n) {
+      bcomp[nb32 * 32 + n]      = 128 * sum_g_lo[n];
+      bcomp[nb32 * 32 + 16 + n] = 128 * sum_g_hi[n];
+      bcomp[N + nb32 * 32 + n]      = 128 * sum_u_lo[n];
+      bcomp[N + nb32 * 32 + 16 + n] = 128 * sum_u_hi[n];
+    }
+  }
+}
+
+// Runtime dispatch flag (set once on first call). Read SHARED_EXPERT_AMX_INT4=1
+// to enable the experimental int4-W1 path; default keeps the int8 baseline.
+static bool use_int4_w1() {
+  static const bool flag = []{
+    const char* e = std::getenv("SHARED_EXPERT_AMX_INT4");
+    return (e && e[0] && e[0] != '0');
+  }();
+  return flag;
+}
+
 // ------------- Weight cache -------------
 
 struct WeightEntry {
-  // Packed weights + per-col-block s32 Bcomp
-  at::Tensor w1_pack, w2_pack;     // int8
+  // Packed weights + per-col-block s32 Bcomp.
+  // w1_pack stores either INT8 VNNI (full 1-byte-per-weight) or INT4 packed
+  // (2 weights per byte). is_int4_w1 records which path was chosen at pack
+  // time; the gemm dispatch must match.
+  at::Tensor w1_pack, w2_pack;     // int8 buffer (raw bytes; int4 path packs 2 weights per byte)
   at::Tensor w1_bcomp, w2_bcomp;   // int32, shape [2*N] and [K]
+  bool is_int4_w1 = false;
 };
 
 struct ShapePool {
@@ -358,99 +564,24 @@ static WeightEntry& get_or_build_entry(
   }
 
   WeightEntry e;
-  // W1: input is s8 [K, 2N] (row-major).
-  // Pack so the 4 sub-blocks per nb_32 super-block (Bg_lo, Bg_hi, Bu_lo,
-  // Bu_hi) sit contiguous in memory. Original layout placed gate and up
-  // sub-blocks 14MB apart, forcing each thread to maintain 4 disjoint
-  // prefetcher streams across DDR. Contiguous layout makes each thread's
-  // W1 access one ~896KB forward stream (4 sub-blocks × 224KB), much
-  // friendlier to the GNR HW prefetcher and DDR row-buffer locality.
-  //
-  // Layout per nb_32 (4 sub-blocks of 16 N-cols each, K/4 K-iter rows):
-  //   offset 0:  Bg_lo (gate cols nb*32 .. nb*32+15)
-  //   offset 1:  Bg_hi (gate cols nb*32+16 .. nb*32+31)
-  //   offset 2:  Bu_lo (up   cols nb*32 .. nb*32+15)
-  //   offset 3:  Bu_hi (up   cols nb*32+16 .. nb*32+31)
-  // Each sub-block is K/4 rows of 16 N × 4 K-bytes (the standard VNNI
-  // INT8 B-tile shape).
-  e.w1_pack = at::empty({K * 2 * N}, at::kChar);
+  e.is_int4_w1 = use_int4_w1();
+  // W1 packing: dispatch on env var SHARED_EXPERT_AMX_INT4.
+  //   - INT8 (default): full 1-byte-per-weight VNNI, contiguous super layout.
+  //   - INT4 (experimental): 2 weights per byte, decoded inline by the AMX
+  //     kernel. Halves W1 DDR traffic (28MB → 14MB) and lifts the DDR-bound
+  //     ceiling, at the cost of int4-RTN accuracy loss.
+  // Layout per nb_32: 4 sub-blocks contiguous (Bg_lo, Bg_hi, Bu_lo, Bu_hi).
   e.w1_bcomp = at::empty({2 * N}, at::kInt);
-  {
-    const int64_t NB32 = N / 32;
-    const int64_t K4 = K / 4;
-    const int64_t sub_bytes = K4 * 16 * 4;
-    const int64_t super_bytes = 4 * sub_bytes;
-    int8_t* dst = e.w1_pack.data_ptr<int8_t>();
-    int32_t* bc = e.w1_bcomp.data_ptr<int32_t>();
-    #pragma omp parallel for schedule(static)
-    for (int64_t nb32 = 0; nb32 < NB32; ++nb32) {
-      int8_t* sp_g_lo = dst + nb32 * super_bytes + 0 * sub_bytes;
-      int8_t* sp_g_hi = dst + nb32 * super_bytes + 1 * sub_bytes;
-      int8_t* sp_u_lo = dst + nb32 * super_bytes + 2 * sub_bytes;
-      int8_t* sp_u_hi = dst + nb32 * super_bytes + 3 * sub_bytes;
-      int32_t sum_g_lo[16] = {0};
-      int32_t sum_g_hi[16] = {0};
-      int32_t sum_u_lo[16] = {0};
-      int32_t sum_u_hi[16] = {0};
-      const int g_base = (int)(nb32 * 32);
-      const int u_base = (int)(N + nb32 * 32);
-      for (int64_t k4 = 0; k4 < K4; ++k4) {
-        const int8_t* row0 = w1_data + (k4 * 4 + 0) * (2 * N);
-        const int8_t* row1 = w1_data + (k4 * 4 + 1) * (2 * N);
-        const int8_t* row2 = w1_data + (k4 * 4 + 2) * (2 * N);
-        const int8_t* row3 = w1_data + (k4 * 4 + 3) * (2 * N);
-        int64_t off = k4 * (16 * 4);
-        for (int n = 0; n < 16; ++n) {
-          // gate lo
-          {
-            int col = g_base + n;
-            int8_t s0 = row0[col], s1 = row1[col], s2 = row2[col], s3 = row3[col];
-            sp_g_lo[off + n*4 + 0] = s0;
-            sp_g_lo[off + n*4 + 1] = s1;
-            sp_g_lo[off + n*4 + 2] = s2;
-            sp_g_lo[off + n*4 + 3] = s3;
-            sum_g_lo[n] += (int32_t)s0 + (int32_t)s1 + (int32_t)s2 + (int32_t)s3;
-          }
-          // gate hi
-          {
-            int col = g_base + 16 + n;
-            int8_t s0 = row0[col], s1 = row1[col], s2 = row2[col], s3 = row3[col];
-            sp_g_hi[off + n*4 + 0] = s0;
-            sp_g_hi[off + n*4 + 1] = s1;
-            sp_g_hi[off + n*4 + 2] = s2;
-            sp_g_hi[off + n*4 + 3] = s3;
-            sum_g_hi[n] += (int32_t)s0 + (int32_t)s1 + (int32_t)s2 + (int32_t)s3;
-          }
-          // up lo
-          {
-            int col = u_base + n;
-            int8_t s0 = row0[col], s1 = row1[col], s2 = row2[col], s3 = row3[col];
-            sp_u_lo[off + n*4 + 0] = s0;
-            sp_u_lo[off + n*4 + 1] = s1;
-            sp_u_lo[off + n*4 + 2] = s2;
-            sp_u_lo[off + n*4 + 3] = s3;
-            sum_u_lo[n] += (int32_t)s0 + (int32_t)s1 + (int32_t)s2 + (int32_t)s3;
-          }
-          // up hi
-          {
-            int col = u_base + 16 + n;
-            int8_t s0 = row0[col], s1 = row1[col], s2 = row2[col], s3 = row3[col];
-            sp_u_hi[off + n*4 + 0] = s0;
-            sp_u_hi[off + n*4 + 1] = s1;
-            sp_u_hi[off + n*4 + 2] = s2;
-            sp_u_hi[off + n*4 + 3] = s3;
-            sum_u_hi[n] += (int32_t)s0 + (int32_t)s1 + (int32_t)s2 + (int32_t)s3;
-          }
-        }
-      }
-      // Bcomp layout matches original: gate cols 0..N-1 then up cols 0..N-1.
-      for (int n = 0; n < 16; ++n) {
-        bc[nb32 * 32 + n]      = 128 * sum_g_lo[n];
-        bc[nb32 * 32 + 16 + n] = 128 * sum_g_hi[n];
-        bc[N + nb32 * 32 + n]      = 128 * sum_u_lo[n];
-        bc[N + nb32 * 32 + 16 + n] = 128 * sum_u_hi[n];
-      }
-    }
+  if (e.is_int4_w1) {
+    e.w1_pack = at::empty({K * 2 * N / 2}, at::kChar);  // half size for int4
+    pack_w1_vnni_int4(
+        e.w1_pack.data_ptr<int8_t>(), e.w1_bcomp.data_ptr<int32_t>(),
+        w1_data, K, N);
+  } else {
+    e.w1_pack = at::empty({K * 2 * N}, at::kChar);
+    pack_w1_vnni_int8(
+        e.w1_pack.data_ptr<int8_t>(), e.w1_bcomp.data_ptr<int32_t>(),
+        w1_data, K, N);
   }
 
   // W2: input is s8 [N, K] (row-major). Pack into [K/16, N/4, 16, 4].
@@ -601,6 +732,60 @@ static ALWAYS_INLINE void amx_gemm_64x16(
   _tile_stored(3, c_out + 48 * 16, ldc_bytes);
 }
 
+// 64 M-rows × 16 N-cols INT4-weight macrogemm. Same scheduling as
+// amx_gemm_64x16, but B is INT4-packed and decoded per K-iter into a
+// per-thread 1KB L1-resident staging tile.
+//
+// INT4 representation: each int4 q in [-8, 7] decodes to int8 via q<<4
+// (i.e. magnitude scaled up by 16). bcomp is precomputed using the
+// decoded sums, so dpbusd's `acc - bcomp` term is consistent. Since q<<4
+// approximates the original int8 weight magnitude (up to int4 RTN error),
+// the original w1_scale applies unchanged at dequant time.
+//
+// Per K-iter: 16 decode ops (32B → 64B each) = ~80 AVX-512 ops, runs in
+// parallel with the AMX engine. DDR-side B traffic is HALVED vs INT8
+// (per-tile read = 512B packed instead of 1024B). On the GNR DDR5 ceiling
+// of ~250 GB/s, the W1 traffic floor drops from ~110us to ~55us.
+static ALWAYS_INLINE void amx_gemm_64x16_int4(
+    const uint8_t* __restrict__ A, int64_t ld_a_bytes,
+    const int8_t* __restrict__ B_packed,  // K_steps × 16 × 32 bytes
+    int32_t* __restrict__ c_out,
+    int64_t K,
+    int8_t* __restrict__ B_stage)         // 1024B aligned scratch
+{
+  _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3);
+  constexpr int64_t ld_b_bytes = 64;
+  constexpr int64_t b_packed_per_iter = 16 * 32;  // 512B packed per K-iter
+  const int64_t K_steps = K / 64;
+  const uint8_t* Ap0 = A;
+  const uint8_t* Ap1 = A + 16 * ld_a_bytes;
+  const uint8_t* Ap2 = A + 32 * ld_a_bytes;
+  const uint8_t* Ap3 = A + 48 * ld_a_bytes;
+  const int8_t* Bp = B_packed;
+  for (int64_t ks = 0; ks < K_steps; ++ks) {
+    // Decode 512B packed -> 1024B staging tile. 16 unrolled decode ops.
+    for (int r = 0; r < 16; ++r) {
+      decode_int4_to_int8_64B(Bp + r * 32, B_stage + r * 64);
+    }
+    _tile_loadd(6, B_stage, ld_b_bytes);
+    _tile_loadd(4, Ap0, ld_a_bytes);
+    _tile_dpbusd(0, 4, 6);
+    _tile_loadd(5, Ap1, ld_a_bytes);
+    _tile_dpbusd(1, 5, 6);
+    _tile_loadd(4, Ap2, ld_a_bytes);
+    _tile_dpbusd(2, 4, 6);
+    _tile_loadd(5, Ap3, ld_a_bytes);
+    _tile_dpbusd(3, 5, 6);
+    Ap0 += 64; Ap1 += 64; Ap2 += 64; Ap3 += 64;
+    Bp += b_packed_per_iter;
+  }
+  constexpr int64_t ldc_bytes = 16 * sizeof(int32_t);
+  _tile_stored(0, c_out + 0  * 16, ldc_bytes);
+  _tile_stored(1, c_out + 16 * 16, ldc_bytes);
+  _tile_stored(2, c_out + 32 * 16, ldc_bytes);
+  _tile_stored(3, c_out + 48 * 16, ldc_bytes);
+}
+
 // 64 M-rows × 32 N-cols macrogemm for Stage 2 path. Loads two B-tiles per
 // K-iter (low/high N halves) and accumulates 4 A-row-halves × 2 N-halves =
 // uses tmm0..3 as 4 of the 8 needed C-tiles, paired with implicit recompute:
@@ -701,11 +886,13 @@ at::Tensor shared_expert_amx_impl(
   float*   f_scratch = pool.f_scratch.data_ptr<float>();
   float*   amax_tpr  = pool.amax_tpr.data_ptr<float>();
 
-  // Block-per-col stride in bytes for packed weights. NB is 1 per 16 N-cols.
-  // W1 packing covers 2N -> (2N/16) blocks, each of size (K/4) * 16 * 4 bytes.
-  const int64_t W1_NB = (2 * N) / 16;
-  const int64_t W1_block_bytes = (K / 4) * 16 * 4;
-  // W2 packing covers K -> (K/16) blocks, each of size (N/4) * 16 * 4 bytes.
+  // Block strides for packed weights. Both INT8 and INT4 paths use the same
+  // contiguous super-block layout (4 sub-blocks: Bg_lo, Bg_hi, Bu_lo, Bu_hi).
+  // INT4 sub-block is half the size of INT8 since 2 weights pack per byte.
+  const bool is_int4 = we.is_int4_w1;
+  const int64_t W1_block_bytes = is_int4 ? (K / 4) * 16 * 2
+                                          : (K / 4) * 16 * 4;
+  // W2 stays INT8: each block is (K/16) blocks of (N/4) × 16 × 4 bytes.
   const int64_t W2_block_bytes = (N / 4) * 16 * 4;
 
   // M=64 single-pass: no mb loop (BLOCK_M == M).
@@ -720,7 +907,6 @@ at::Tensor shared_expert_amx_impl(
   // f_scratch hot in L2 across the amax reduction.
   const float routed = (float)routed_scaling_factor;
   const __m512 vroute = _mm512_set1_ps(routed);
-  (void)W1_NB;
 
   // Per-stage wall-clock snapshots, written only by thread 0 just after each
   // barrier. Variables declared before the parallel region are implicitly
@@ -794,8 +980,11 @@ at::Tensor shared_expert_amx_impl(
     alignas(64) int32_t cu_lo[64 * 16];
     alignas(64) int32_t cg_hi[64 * 16];
     alignas(64) int32_t cu_hi[64 * 16];
-    // Per nb_32 super-block: 4 sub-blocks contiguous in memory at offsets
-    // 0, 1, 2, 3 = Bg_lo, Bg_hi, Bu_lo, Bu_hi (each W1_block_bytes long).
+    // Per-thread int4-decode staging tile (1KB, fits in L1d). Used only on
+    // the int4 path; the int8 path tile_loads directly from packed memory.
+    alignas(64) int8_t B_stage[1024];
+    // Per nb_32 super-block: 4 sub-blocks contiguous at offsets 0, 1, 2, 3
+    // = Bg_lo, Bg_hi, Bu_lo, Bu_hi. Sub-block size depends on int4/int8.
     const int64_t W1_super_bytes = 4 * W1_block_bytes;
     #pragma omp for schedule(static) nowait
     for (int64_t nb = 0; nb < NB1; ++nb) {
@@ -820,14 +1009,20 @@ at::Tensor shared_expert_amx_impl(
       const float*   Ag = qisc;       // [M] per-row scales
       float* fo_row = f_scratch + n0; // [M, N] strided
 
-      // 4 GEMMs per nb (gate_lo, gate_hi, up_lo, up_hi). Each reads its
-      // 16-N-col B-block exactly once and reuses across all 64 M-rows.
-      // Issue order matches memory layout (Bg_lo, Bg_hi, Bu_lo, Bu_hi
-      // sit contiguous), so each thread sees one ~896KB forward stream.
-      amx_gemm_64x16(A, K, Bg_lo, cg_lo, K);
-      amx_gemm_64x16(A, K, Bg_hi, cg_hi, K);
-      amx_gemm_64x16(A, K, Bu_lo, cu_lo, K);
-      amx_gemm_64x16(A, K, Bu_hi, cu_hi, K);
+      // 4 GEMMs per nb. Dispatch on int4/int8: int4 path decodes inline
+      // into B_stage; int8 path tile_loads directly. bcomp + w1_scale
+      // semantics match in both paths (see pack_w1_vnni_int4 / int8).
+      if (is_int4) {
+        amx_gemm_64x16_int4(A, K, Bg_lo, cg_lo, K, B_stage);
+        amx_gemm_64x16_int4(A, K, Bg_hi, cg_hi, K, B_stage);
+        amx_gemm_64x16_int4(A, K, Bu_lo, cu_lo, K, B_stage);
+        amx_gemm_64x16_int4(A, K, Bu_hi, cu_hi, K, B_stage);
+      } else {
+        amx_gemm_64x16(A, K, Bg_lo, cg_lo, K);
+        amx_gemm_64x16(A, K, Bg_hi, cg_hi, K);
+        amx_gemm_64x16(A, K, Bu_lo, cu_lo, K);
+        amx_gemm_64x16(A, K, Bu_hi, cu_hi, K);
+      }
 
       // Per-row 16-lane amax accumulators across both lo+hi halves.
       for (int r = 0; r < 64; ++r) {
@@ -871,8 +1066,6 @@ at::Tensor shared_expert_amx_impl(
     // threads), at the cost of nthr-fold redundant compute on a 2KB buffer.
     alignas(64) float local_inv[64];
     {
-      // 16-lane reduce across threads. All threads compute identical
-      // intsc[]; concurrent stores are safe (idempotent).
       for (int64_t m0 = 0; m0 < M; m0 += 16) {
         int64_t chunk = std::min<int64_t>(16, M - m0);
         __m512 am = _mm512_setzero_ps();
