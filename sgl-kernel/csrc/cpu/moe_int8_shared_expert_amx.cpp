@@ -1,42 +1,43 @@
 // moe_int8_shared_expert_amx.cpp
-// Hand-rolled AMX INT8 shared-expert kernel.
+// Hand-rolled AMX INT8 shared-expert kernel for the SwiGLU MLP block.
 //
-// Goal: close the 45% gap vs the target 260us for M=64, N=2048, K=7168
-// by eliminating the int32 intermediate round-trip and collapsing the
-// OMP parallel regions that the oneDNN / brgemm paths incur per call.
+// Compute: out[M, K] = SiLU(X·W1_g)·(X·W1_u)·W2 + routed_scaling * fused_out
+// where X is bf16 [M, K], W1 is int8 [K, 2N] (gate/up concatenated along N),
+// W2 is int8 [N, K], and routed_scaling/fused_out come from MoE routing.
 //
-// Layout:
-//   A: u8 [M, K]                  (row-major)
-//   W1 packed per-col-block: s8 [NB, K/4, BLOCK_N, 4] VNNI INT8
-//     with per-block Bcomp s32 [NB, BLOCK_N] stored alongside
-//   W2 packed per-col-block: s8 [NB, N/4, BLOCK_N, 4]
-//     (note W2's "N" here is OC=K; "K" inside the inner loop is IC=N=2048)
+// Pipeline stages (all run in a single OMP parallel region; barriers between):
+//   Stage 0:    Quantize X (bf16 -> u8) row-parallel, per-row dynamic scale.
+//   Stage 1:    GEMM(qX, W1) in INT8 AMX -> dequant -> SiLU(g)*u -> fp32 scratch.
+//               Per-row amax tracked for the next quant step.
+//   Stage 1.5:  Reduce amax across threads, requantize fp32 scratch -> u8 (qi2).
+//   Stage 2:    GEMM(qi2, W2) in INT8 AMX -> dequant -> add routed_scaling*fused
+//               -> bf16 output.
 //
-// Stage scheduling (for M=64, BLOCK_M=32, BLOCK_N=32):
-//   Stage 1 (W1 matmul + SiLU*Mul -> u8 requant):
-//     - Parallel on (mb, nb) grid = (2, N/BLOCK_N) = (2, 64) = 128 tiles
-//       With 32 threads, each thread owns 4 output tiles.
-//     - Per tile: run K-loop in 2 output column halves (gate + up)
-//       to avoid doubling the N parallelism; accumulate Cgate/Cup in
-//       tmm0..tmm3 against shared A tiles tmm4..tmm5, load weights
-//       into tmm6..tmm7.
-//     - After K loop: tile_stored to per-thread s32 scratch (32x64 words),
-//       dequant in AVX-512, apply SiLU(g)*u, write to per-row f32 scratch,
-//       track amax.
-//     - After all N-tiles for a given M-row set: compute inv_scale from
-//       amax, scan f32 scratch, quantize to u8 -> A2.
+// Key optimizations:
+//   - W1 packed in contiguous-super-block VNNI layout (4 sub-blocks per nb_32:
+//     gate-lo, gate-hi, up-lo, up-hi) so each thread reads its W1 slice as
+//     one big forward stream, friendly to the HW prefetcher and DDR row-buffer.
+//   - Stage 1 GEMM uses a 64-row × 16-col macrokernel that loads B once per
+//     K-iter and reuses across all 4 row-strips, with `_tile_stream_loadd`
+//     to bypass L1/L2 (B is read-once across the call). The M-loop chunks
+//     into 64-row blocks (fast path) plus a 32-row tail for M values not
+//     divisible by 64.
+//   - Stage 2 GEMM uses a 32-row × 32-col macrokernel with an outer mb loop;
+//     B-tiles are reused across mb iters within one nb so it stays on the
+//     temporal `_tile_loadd`.
+//   - Stage 1.5 fuses the cross-thread amax reduce with the requant pass:
+//     each thread redundantly computes per-row inv (~1us) instead of needing
+//     a separate omp-for + barrier between reduce and requant.
+//   - All omp-for loops use `schedule(static)` so thread→work mapping is
+//     consistent across packing and compute phases. Combined with first-touch
+//     page placement, this makes per-thread weight access NUMA-local on
+//     multi-node configurations (e.g. `numactl --membind=0,1`).
 //
-//   Stage 2 (W2 matmul + scaled add -> bf16 out):
-//     - Same tile schedule over (mb, nb) for OC=K=7168.
-//     - Per tile: K-loop over IC=N=2048; only one output stream (no gate/up).
-//     - After K loop: tile_stored to per-thread s32 scratch, then dequant
-//       + add routed_scaling * fused_out -> bf16 store.
+// Per-weight-pair cache: packed weights + Bcomp computed on first sight and
+// reused, keyed on (w1_ptr, w2_ptr). LRU evict at kMaxCached entries.
 //
-// Per-weight-pair cache: VNNI-packed weights + Bcomp precomputed on first
-// sight, keyed on (w1_ptr, w2_ptr).
-//
-// Correctness tolerance matches the existing oneDNN path: diff_rms / ref_rms
-// < 5% against BRGEMM on random data.
+// Constraints: M > 0 and M % 32 == 0, M <= 1024 (stack-buffer cap).
+// Correctness target: diff_rms / ref_rms < 5% vs BRGEMM on random int8 weights.
 
 #if defined(__x86_64__) || defined(_M_X64)
 
@@ -155,20 +156,12 @@ static bool request_amx_permission_once() {
   return ok;
 }
 
-// Tile-register assignments (fixed convention used by both kernels):
-//   tmm0: Cacc[0]  (16x16 s32)  -- accumulator, top half rows 0..15
-//   tmm1: Cacc[1]  (16x16 s32)  --             , bottom half rows 16..31
-//   tmm2: Cacc[2]  (16x16 s32)  -- gate(top)   OR unused for stage2 path
-//   tmm3: Cacc[3]  (16x16 s32)  -- gate(bot)   OR unused for stage2 path
-//   tmm4: A[0]     (16x64 u8)   -- A rows 0..15 for 64 K bytes
-//   tmm5: A[1]     (16x64 u8)   -- A rows 16..31 for 64 K bytes
-//   tmm6: B[0]     (16x64 s8)   -- BLOCK_N=16 cols (VNNI: 16 rows * 4 K)
-//   tmm7: B[1]     (16x64 s8)   -- BLOCK_N=16 cols (second 16-col half)
-//
-// Row/col config for INT8 AMX:
-//   - A (u8): 16 rows, 64 cols (colsb=64)
-//   - B (s8): 16 rows, 64 cols (each "row" = 16 cols x 4 vnni bytes)
-//   - C (s32): 16 rows, 64 cols (= 16 int32 elements)
+// AMX tile-register convention. All 8 tiles are configured uniformly as
+// 16 rows × 64 column-bytes (the maximum AMX supports). For INT8 ops:
+//   - A tile (u8):  16 M-rows × 64 K-bytes
+//   - B tile (s8):  16 K-iter rows × 64 bytes (= 16 N-cols × 4 K-bytes VNNI)
+//   - C tile (s32): 16 M-rows × 16 N-cols (each cell is 4 bytes)
+// Specific tmm assignments are documented per-kernel below.
 
 static AmxTileConfig make_amx_cfg_int8() {
   AmxTileConfig c{};
@@ -233,15 +226,13 @@ static inline __m512 silu_ps(__m512 g) {
 }
 #endif
 
-// ------------- Weight packing: s8 [K, N] row-major -> VNNI [N/16, K/4, 16, 4] -------------
-//
-// AMX INT8 B-tile expects 16 rows of (16 cols * 4 k-steps) = 1024 bytes.
-// Storing NB blocks of BLOCK_N=16 each lets tile_loadd stream sequentially
-// with a tile stride of 64 bytes.
-//
-// Input src layout: s8[K, N] row-major with ld_src = N.
-// Output layout per block (of 16 N-cols): K/4 rows of (16 N * 4 K) = 64 bytes each.
-// Block stride in bytes = (K/4) * 64.
+// VNNI packer for s8 [K, N] row-major -> [N/16, K/4, 16, 4]. AMX INT8 B-tile
+// expects each "row" to hold 16 N-cols × 4 K-bytes = 64 bytes; a tile is 16
+// such rows. We emit NB sub-blocks of 16 N-cols each, contiguous in memory
+// per sub-block so tile_loadd streams sequentially with stride 64 bytes.
+// Bcomp = 128 * sum_K(W) is precomputed per N-col so dpbusd's `(A+128)·W`
+// result can be corrected to `A·W` by subtracting bcomp at dequant time.
+// Used for W2 (Stage 2). W1 uses a different layout — see pack_w1_vnni.
 static void pack_b_vnni_s8(
     int8_t* __restrict__ dst, int32_t* __restrict__ bcomp,
     const int8_t* __restrict__ src,
@@ -278,11 +269,13 @@ static void pack_b_vnni_s8(
   }
 }
 
-// W1 INT8 packer with contiguous-super-block layout (4 sub-blocks per nb_32
-// super: Bg_lo, Bg_hi, Bu_lo, Bu_hi laid out adjacent in memory). Each thread
-// reads its W1 slice as one big forward stream, friendlier to the GNR HW
-// prefetcher and DDR row-buffer locality than the per-sub-block layout used
-// by pack_b_vnni_s8 (which leaves gate/up sub-blocks 14MB apart).
+// W1 packer (input s8 [K, 2N] gate||up). Layout: NB32 super-blocks of 4
+// adjacent VNNI sub-blocks {gate-lo, gate-hi, up-lo, up-hi}, each covering
+// 16 N-cols. Adjacency matters: the Stage-1 GEMM consumes all 4 sub-blocks
+// of a super in sequence per thread, so each thread reads its W1 slice as
+// one big forward stream (vs. having gate-lo and up-lo N/2 bytes apart in
+// the standard pack_b_vnni_s8 layout). Bcomp computed per col, indexed
+// the same as the original [2N] layout (gate cols 0..N-1, up cols N..2N-1).
 static void pack_w1_vnni(
     int8_t* __restrict__ dst, int32_t* __restrict__ bcomp,
     const int8_t* __restrict__ w1_data,
@@ -423,19 +416,13 @@ static WeightEntry& get_or_build_entry(
 
 // ------------- AMX tile kernel helpers -------------
 
-// Fused gate+up macrogemm for 32 M-rows × 16 gate-cols × 16 up-cols.
-// Uses all 8 AMX tile registers in a single K-loop:
-//   tmm0: Cgate[rows 0..15,  cols 0..15]
-//   tmm1: Cgate[rows 16..31, cols 0..15]
-//   tmm2: Cup  [rows 0..15,  cols 0..15]
-//   tmm3: Cup  [rows 16..31, cols 0..15]
-//   tmm4: A[rows 0..15]   (64 K-bytes)
-//   tmm5: A[rows 16..31]  (64 K-bytes)
-//   tmm6: Bg (16 N-cols × 4 K-bytes VNNI)
-//   tmm7: Bu (16 N-cols × 4 K-bytes VNNI)
-// Per K-iter: 4 tile_loadd + 4 tile_dpbusd. A is loaded once and fed to
-// both gate and up -- vs the prior 32x32 "gate-then-up" scheme which
-// streamed A through the core twice.
+// 32-row × 16-col gate+up macrogemm (used as the M-row tail when M%64==32).
+// Uses all 8 AMX tile registers, sharing A across gate and up:
+//   tmm0..3: 4 C-acc tiles { (gate, up) × (rows 0..15, rows 16..31) }
+//   tmm4,5:  2 A-tiles (rows 0..15, 16..31) reused for gate and up
+//   tmm6,7:  Bg, Bu tiles (16 N-cols each, VNNI-packed)
+// Per K-iter: 4 loads + 4 dpbusd. A is loaded once and fed to both gate
+// and up dpbusd ops, halving A-traffic vs separate gate/up calls.
 static ALWAYS_INLINE void amx_gemm_32x16_gu(
     const uint8_t* __restrict__ A, int64_t ld_a_bytes,
     const int8_t* __restrict__ Bg, const int8_t* __restrict__ Bu,
@@ -445,12 +432,12 @@ static ALWAYS_INLINE void amx_gemm_32x16_gu(
   constexpr int64_t ld_b_bytes = 64;
   constexpr int64_t b_row_stride = 16 * ld_b_bytes;  // 1024 bytes per K-iter
   const int64_t K_steps = K / 64;
+  // Pointer-advance form (cheaper address-gen than ks*constant indexing).
+  // No SW prefetch — HW handles the two 1KB/iter B streams; explicit prefetch
+  // adds AGU pressure with no measurable win on SPR/GNR.
   const uint8_t* Ap = A;
   const int8_t* Bgp = Bg;
   const int8_t* Bup = Bu;
-  // Pointer-advance form: fewer imul uops per iteration than ks*constant.
-  // No SW prefetch -- HW prefetcher handles the two 1KB-per-iter B streams
-  // and SW pf adds pressure to the address-gen unit on SPR.
   for (int64_t ks = 0; ks < K_steps; ++ks) {
     _tile_loadd(4, Ap, ld_a_bytes);
     _tile_loadd(5, Ap + 16 * ld_a_bytes, ld_a_bytes);
@@ -471,10 +458,14 @@ static ALWAYS_INLINE void amx_gemm_32x16_gu(
   _tile_stored(3, cu_out + 16 * 16, ldc_bytes);
 }
 
-// 32 rows × 32 cols macrogemm for Stage 2 (no gate/up pairing).
-//   tmm0..3: Cacc (4 tiles of 16×16 s32)
-//   tmm4..5: A rows 0..15, 16..31
-//   tmm6..7: B cols 0..15, 16..31
+// 32-row × 32-col macrogemm for Stage 2 (single output stream, no gate/up):
+//   tmm0..3: 4 C-acc tiles covering (rows 0..15, 16..31) × (cols 0..15, 16..31)
+//   tmm4,5:  A rows 0..15, 16..31
+//   tmm6,7:  B cols 0..15, 16..31 (paired so A is loaded once per K-iter
+//            and fed to both N-halves; same A-reuse trick as 32x16_gu).
+// Caller wraps with an outer mb loop (mb=0..M/32) so B-tiles are reused
+// across A row-strips within one nb — keeps B in temporal cache, hence
+// regular `_tile_loadd` (not `_tile_stream_loadd`).
 static ALWAYS_INLINE void amx_gemm_32x32(
     const uint8_t* __restrict__ A, int64_t ld_a_bytes,
     const int8_t* __restrict__ B0, const int8_t* __restrict__ B1,
@@ -506,30 +497,18 @@ static ALWAYS_INLINE void amx_gemm_32x32(
   _tile_stored(3, c_buf + 16 * 32 + 16, ldc_bytes);
 }
 
-// 64 M-rows × 16 N-cols macrogemm. B is loaded once per K-iter and reused
-// across all 4 row-halves (rows 0-15, 16-31, 32-47, 48-63). vs. the 32x16 +
-// outer mb=2 scheme this halves B-traffic per thread, which is the dominant
-// term for stage 1 (W1 GEMM) on M=64.
+// 64-row × 16-col macrogemm — Stage 1 fast path. B is loaded once per K-iter
+// and reused across 4 A row-strips (M-rows 0..15, 16..31, 32..47, 48..63),
+// so B-traffic per thread is halved vs. the older 32x16 + outer mb=2 scheme.
 //
 // Tile usage:
-//   tmm0..3: 4 C-acc tiles (s32, 16x16 each), one per row-half
-//   tmm4..5: 2 A-tiles (u8, 16x64 each), reloaded each K-iter
-//   tmm6:    1 B-tile (s8, 16 N × 4 K bytes)
-//   tmm7:    unused (reserved for future overlap)
-//
-// Per K-iter (64 K-bytes): 1 B-load + 4 A-loads + 4 dpbusd
-//   B is L1-resident after the first iter for that nb-super-block, so the
-//   real cost is the 4 A-tile loads (A is L1-resident at K=7168 / per
-//   thread = 28KB row size, which is bigger than L1 but the streamer
-//   prefetches forward).
-// B is loaded via _tile_stream_loadd (non-temporal): each W1 byte is read
-// exactly once per call, so caching it in L1d/L2 only displaces A — which
-// IS reused 4× per K-iter across the row-strips. The non-temporal hint
-// frees those cache lines for A and the C-acc scratches, lifting effective
-// bandwidth on DDR-bound stage 1.
-//
-// Stage 2's amx_gemm_32x32 has a different pattern (mb=2 outer reuses B
-// across two A row-strips within one nb), so it stays on temporal tile_loadd.
+//   tmm0..3: 4 C-acc tiles, one per row-strip (16 rows × 16 cols each)
+//   tmm4,5:  2 A-tiles, alternated to feed odd/even row-strips
+//   tmm6:    1 B-tile, loaded via `_tile_stream_loadd` (non-temporal): W1
+//            is read-once across the whole call, so caching it would only
+//            displace A and the C-acc scratches.
+//   tmm7:    unused
+// Per K-iter: 1 B-load + 4 A-loads + 4 dpbusd.
 static ALWAYS_INLINE void amx_gemm_64x16(
     const uint8_t* __restrict__ A, int64_t ld_a_bytes,
     const int8_t* __restrict__ B,
@@ -661,28 +640,21 @@ at::Tensor shared_expert_amx_impl(
   float*   f_scratch = pool.f_scratch.data_ptr<float>();
   float*   amax_tpr  = pool.amax_tpr.data_ptr<float>();
 
-  // Block strides for packed weights.
-  // W1: 4 sub-blocks per nb_32 (Bg_lo, Bg_hi, Bu_lo, Bu_hi), contiguous in
-  // memory. Each sub is K/4 × 16 × 4 bytes.
-  const int64_t W1_block_bytes = (K / 4) * 16 * 4;
-  // W2: each block is (K/16) blocks of (N/4) × 16 × 4 bytes.
-  const int64_t W2_block_bytes = (N / 4) * 16 * 4;
+  // Sub-block strides for packed weights (1 sub-block = 16 N-cols).
+  const int64_t W1_block_bytes = (K / 4) * 16 * 4;  // 4 subs/super in W1
+  const int64_t W2_block_bytes = (N / 4) * 16 * 4;  // standard VNNI for W2
 
-  (void)BLOCK_M;  // BLOCK_M is the AMX granularity; mb chunking is done inside Stage 1/2 below.
-  const int64_t NB1 = N / BLOCK_N;            // stage1 N-tiles (gate/up share nb)
-  const int64_t NB2 = K / BLOCK_N;            // stage2 OC-tiles
+  (void)BLOCK_M;  // BLOCK_M is the AMX row granularity; M-chunking is in Stage 1/2.
+  const int64_t NB1 = N / BLOCK_N;  // Stage 1 N-tiles (gate/up share each nb)
+  const int64_t NB2 = K / BLOCK_N;  // Stage 2 OC-tiles
 
-  // One OMP region covers Stage 0 (input quant), Stage 1 (w1 gemm + silu*mul
-  // with per-thread amax accumulation), Stage 1.5 (reduce amax + u8 requant),
-  // Stage 2 (w2 gemm + dequant + scaled add). Barriers sync between stages.
-  // Merging saves 2-3 fork/join cycles (~10-15us at 32 threads) and keeps
-  // f_scratch hot in L2 across the amax reduction.
+  // One OMP parallel region spans Stages 0–2; barriers separate stages.
+  // Saves 2–3 fork/join cycles vs. multiple regions and keeps fp32 scratch
+  // hot in L2 across the amax-reduce step.
   const float routed = (float)routed_scaling_factor;
   const __m512 vroute = _mm512_set1_ps(routed);
 
-  // Per-stage wall-clock snapshots, written only by thread 0 just after each
-  // barrier. Variables declared before the parallel region are implicitly
-  // shared across threads.
+  // Per-stage wall-clock snapshots, written only by thread 0 between barriers.
   int64_t _t_s0 = 0, _t_s1 = 0, _t_s1red = 0, _t_s1req = 0, _t_s2 = 0;
   if (_timing) { _t_stage_start = now_ns(); _tm.ns_setup.fetch_add(_t_stage_start - _t_call_start, std::memory_order_relaxed); }
 
@@ -741,29 +713,22 @@ at::Tensor shared_expert_amx_impl(
     #pragma omp barrier
     if (_timing && tid == 0) _t_s0 = now_ns();
 
-    // ---- Stage 1: W1 gemm + SiLU*Mul. Per-thread tracks partial per-row amax
-    // over the nb-slice it owns.
+    // ---- Stage 1: W1 GEMM + SiLU*Mul, per-row amax tracked for next quant.
+    // Per nb-tile (32 N-cols = 16 gate + 16 up), the M-loop chunks into 64-row
+    // fast blocks via amx_gemm_64x16, plus a 32-row tail via amx_gemm_32x16_gu
+    // when M%64==32. M=64 hits exactly one fast iter and zero tail iters.
     //
-    // For each nb-tile (16+16 = 32 N-cols of gate+up), chunk M into 64-row
-    // fast blocks (amx_gemm_64x16, 4 C-tiles in flight) and a 32-row tail
-    // (amx_gemm_32x16_gu, also 4 C-tiles). M=64 hits exactly one fast iter
-    // and zero tail iters.
+    // The post-process body is inlined at both call sites (no lambda) so the
+    // compiler keeps the AVX-512 constants (vbc_*, vbs_*) in zmm registers
+    // across the row loop. The tail is __builtin_expect(...,0)-marked so it
+    // lands in a cold section, preserving the hot path's icache footprint.
     //
-    // The post-process body is duplicated at both call sites (rather than
-    // factored into a lambda) so the compiler can keep the AVX-512 constants
-    // (vbc_*, vbs_*) in zmm registers across the inner row loop. The tail
-    // branch is marked __builtin_expect(...,0) so the compiler lays it out
-    // in a cold section after the hot fast path — keeps the M=64 path's
-    // icache footprint identical to the specialized original.
-    //
-    // Scratch sized for the 64-row fast path; the 32-row path uses the
-    // first 32×16 entries.
+    // Scratch holds C-acc tiles for up to 64 rows; tail uses the first 32×16.
     alignas(64) int32_t cg_lo[64 * 16];
     alignas(64) int32_t cu_lo[64 * 16];
     alignas(64) int32_t cg_hi[64 * 16];
     alignas(64) int32_t cu_hi[64 * 16];
-    // Per nb_32 super-block: 4 sub-blocks contiguous at offsets 0, 1, 2, 3
-    // = Bg_lo, Bg_hi, Bu_lo, Bu_hi (each W1_block_bytes long).
+    // 4 sub-blocks per W1 super (Bg_lo, Bg_hi, Bu_lo, Bu_hi), adjacent in memory.
     const int64_t W1_super_bytes = 4 * W1_block_bytes;
     #pragma omp for schedule(static) nowait
     for (int64_t nb = 0; nb < NB1; ++nb) {
@@ -828,9 +793,8 @@ at::Tensor shared_expert_amx_impl(
         m0 += 64;
       }
 
-      // ---- Cold tail: 32-row block, only when M%64 == 32. ----
-      // __builtin_expect(...,0) hints the compiler to lay this branch out in
-      // a cold section so the hot M=64 path stays compact in icache.
+      // ---- Cold tail: 32-row block, taken iff M%64==32. ----
+      // __builtin_expect(...,0) keeps this out of the hot path's icache.
       if (__builtin_expect(m0 < M, 0)) {
         const uint8_t* A = qi + m0 * K;
         const float*   Ag = qisc + m0;
@@ -871,12 +835,12 @@ at::Tensor shared_expert_amx_impl(
     #pragma omp barrier
     if (_timing && tid == 0) _t_s1 = now_ns();
 
-    // ---- Stage 1.5 (fused reduce + requant): each thread redundantly
-    // computes per-row inv from amax_tpr (cheap: M*nthr fp32 read,
-    // M*4 bytes written), then requantizes its nb-slice of f_scratch -> qi2.
-    // Eliminates the barrier between reduce and requant (saves ~5us at 32
-    // threads), at the cost of nthr-fold redundant compute on a small buffer.
-    // Stack-allocated; sized for typical batch sizes (cap = 1024 → 4KB).
+    // ---- Stage 1.5: fused amax-reduce + requant.
+    // Each thread redundantly reduces amax across threads (~M*nthr fp32 read,
+    // M*4 bytes written; ~1us total) instead of doing it via #pragma omp for,
+    // which lets us skip the barrier between reduce and requant (saves ~5us
+    // at 32 threads). The redundant work is cheap because amax_tpr is small.
+    // local_inv stack-allocated; sized for M cap = 1024 (4KB).
     alignas(64) float local_inv[1024];
     {
       for (int64_t m0 = 0; m0 < M; m0 += 16) {
@@ -918,12 +882,11 @@ at::Tensor shared_expert_amx_impl(
     #pragma omp barrier
     if (_timing && tid == 0) _t_s1req = now_ns();
 
-    // ---- Stage 2: W2 gemm + dequant + scaled add -> bf16 out.
-    // 32 M-rows × 32 N-cols paired tile (B_lo + B_hi loaded together so A is
-    // streamed only once per K-iter for both halves). Outer mb loop iterates
-    // M/32 chunks. The 64x16 single-pass scheme regressed here: K=2048 is too
-    // short for the per-call setup amortization to dominate, and A2 is small
-    // (M×N bytes) so it's L2-resident anyway, making the mb retread cheap.
+    // ---- Stage 2: W2 GEMM + dequant + scaled add -> bf16 output.
+    // 32-row × 32-col paired-N-tile kernel; outer mb loop iterates M/32 chunks.
+    // We don't use the 64x16 fast path here because K=N=2048 is too short to
+    // amortize per-call setup; the A2 buffer (M×N) fits in L2, so the mb=M/32
+    // loop's B reuse outweighs the win from a single-pass over M.
     const int64_t MB2 = M / 32;
     alignas(64) int32_t cacc[32 * 32];
     #pragma omp for schedule(static) nowait
