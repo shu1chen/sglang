@@ -591,9 +591,18 @@ at::Tensor shared_expert_amx_impl(
   CHECK_EQ(w1_scale.numel(), 2 * N);
   CHECK_EQ(w2_scale.numel(), K);
 
-  constexpr int64_t BLOCK_M = 64;  // M=64 single-pass (4 row-halves in 4 C-tiles)
+  // BLOCK_M = 32: AMX rows-per-tile granularity. Each thread chunks its
+  // M-row work into 64-row blocks (using amx_gemm_64x16, 4 C-tiles in flight)
+  // and a 32-row tail block (using amx_gemm_32x16_gu, also 4 C-tiles). Any
+  // M that's a multiple of 32 is supported; M=64 hits the fast path purely.
+  constexpr int64_t BLOCK_M = 32;
   constexpr int64_t BLOCK_N = 32;  // two 16-wide AMX tiles side-by-side
-  TORCH_CHECK(M == 64, "shared_expert_amx: M must equal 64 (specialized kernel), got ", M);
+  TORCH_CHECK(M > 0 && M % BLOCK_M == 0,
+      "shared_expert_amx: M must be a positive multiple of 32, got ", M);
+  // Cap from the per-thread stack-resident `local_inv[1024]` in Stage 1.5;
+  // bump both together if you need larger M.
+  TORCH_CHECK(M <= 1024,
+      "shared_expert_amx: M must be <= 1024 (stack-buffer cap), got ", M);
   TORCH_CHECK(N % BLOCK_N == 0, "shared_expert_amx: N must be multiple of 32, got ", N);
   TORCH_CHECK(K % BLOCK_N == 0, "shared_expert_amx: K must be multiple of 32, got ", K);
   TORCH_CHECK(K % 64 == 0, "shared_expert_amx: K must be multiple of 64 (AMX 64-byte step)");
@@ -637,6 +646,7 @@ at::Tensor shared_expert_amx_impl(
       p.intsc     = at::empty({M}, at::kFloat);
       p.f_scratch = at::empty({M * N}, at::kFloat);
       p.M = M; p.N = N; p.K = K;
+      p.amax_nth = 0;  // force amax_tpr re-alloc below
     }
     if (p.amax_nth != nth) {
       p.amax_tpr = at::empty({nth * M}, at::kFloat);
@@ -658,8 +668,7 @@ at::Tensor shared_expert_amx_impl(
   // W2: each block is (K/16) blocks of (N/4) × 16 × 4 bytes.
   const int64_t W2_block_bytes = (N / 4) * 16 * 4;
 
-  // M=64 single-pass: no mb loop (BLOCK_M == M).
-  (void)BLOCK_M;
+  (void)BLOCK_M;  // BLOCK_M is the AMX granularity; mb chunking is done inside Stage 1/2 below.
   const int64_t NB1 = N / BLOCK_N;            // stage1 N-tiles (gate/up share nb)
   const int64_t NB2 = K / BLOCK_N;            // stage2 OC-tiles
 
@@ -735,10 +744,20 @@ at::Tensor shared_expert_amx_impl(
     // ---- Stage 1: W1 gemm + SiLU*Mul. Per-thread tracks partial per-row amax
     // over the nb-slice it owns.
     //
-    // M=64 single-pass: each AMX gemm covers all 64 M-rows × 16 N-cols
-    // against a B-tile loaded once per K-iter (vs. the prior 32M scheme that
-    // re-streamed the same B-tile twice for mb=0/1). This halves W1 traffic
-    // per thread, which is the dominant cost of stage 1.
+    // For each nb-tile (16+16 = 32 N-cols of gate+up), chunk M into 64-row
+    // fast blocks (amx_gemm_64x16, 4 C-tiles in flight) and a 32-row tail
+    // (amx_gemm_32x16_gu, also 4 C-tiles). M=64 hits exactly one fast iter
+    // and zero tail iters.
+    //
+    // The post-process body is duplicated at both call sites (rather than
+    // factored into a lambda) so the compiler can keep the AVX-512 constants
+    // (vbc_*, vbs_*) in zmm registers across the inner row loop. The tail
+    // branch is marked __builtin_expect(...,0) so the compiler lays it out
+    // in a cold section after the hot fast path — keeps the M=64 path's
+    // icache footprint identical to the specialized original.
+    //
+    // Scratch sized for the 64-row fast path; the 32-row path uses the
+    // first 32×16 entries.
     alignas(64) int32_t cg_lo[64 * 16];
     alignas(64) int32_t cu_lo[64 * 16];
     alignas(64) int32_t cg_hi[64 * 16];
@@ -765,48 +784,87 @@ at::Tensor shared_expert_amx_impl(
       __m512i vbc_u1 = _mm512_loadu_si512(w1_bc + N + n0 + 16);
       const __m512 signBit = _mm512_set1_ps(-0.0f);
 
-      const uint8_t* A = qi;          // M=64 starts at row 0
-      const float*   Ag = qisc;       // [M] per-row scales
-      float* fo_row = f_scratch + n0; // [M, N] strided
+      // ---- Fast path: 64-row chunks ----
+      int64_t m0 = 0;
+      while (m0 + 64 <= M) {
+        const uint8_t* A = qi + m0 * K;
+        const float*   Ag = qisc + m0;
+        float* fo_row = f_scratch + m0 * N + n0;
 
-      // 4 GEMMs per nb (gate_lo, gate_hi, up_lo, up_hi). Each reads its
-      // 16-N-col B-block exactly once and reuses across all 64 M-rows.
-      // Issue order matches memory layout, so each thread sees one ~896KB
-      // forward stream.
-      amx_gemm_64x16(A, K, Bg_lo, cg_lo, K);
-      amx_gemm_64x16(A, K, Bg_hi, cg_hi, K);
-      amx_gemm_64x16(A, K, Bu_lo, cu_lo, K);
-      amx_gemm_64x16(A, K, Bu_hi, cu_hi, K);
+        amx_gemm_64x16(A, K, Bg_lo, cg_lo, K);
+        amx_gemm_64x16(A, K, Bg_hi, cg_hi, K);
+        amx_gemm_64x16(A, K, Bu_lo, cu_lo, K);
+        amx_gemm_64x16(A, K, Bu_hi, cu_hi, K);
 
-      // Per-row 16-lane amax accumulators across both lo+hi halves.
-      for (int r = 0; r < 64; ++r) {
-        __m512 vas = _mm512_set1_ps(Ag[r]);
-        // lo half (cols n0..n0+15)
-        __m512i icg = _mm512_loadu_si512(cg_lo + r * 16);
-        __m512i icu = _mm512_loadu_si512(cu_lo + r * 16);
-        __m512 g = _mm512_mul_ps(_mm512_mul_ps(
-            _mm512_cvtepi32_ps(_mm512_sub_epi32(icg, vbc_g0)), vas), vbs_g0);
-        __m512 u = _mm512_mul_ps(_mm512_mul_ps(
-            _mm512_cvtepi32_ps(_mm512_sub_epi32(icu, vbc_u0)), vas), vbs_u0);
-        __m512 vlo = _mm512_mul_ps(silu_ps(g), u);
-        _mm512_storeu_ps(fo_row + r * N, vlo);
+        for (int r = 0; r < 64; ++r) {
+          __m512 vas = _mm512_set1_ps(Ag[r]);
+          // lo half (cols n0..n0+15)
+          __m512i icg = _mm512_loadu_si512(cg_lo + r * 16);
+          __m512i icu = _mm512_loadu_si512(cu_lo + r * 16);
+          __m512 g = _mm512_mul_ps(_mm512_mul_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(icg, vbc_g0)), vas), vbs_g0);
+          __m512 u = _mm512_mul_ps(_mm512_mul_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(icu, vbc_u0)), vas), vbs_u0);
+          __m512 vlo = _mm512_mul_ps(silu_ps(g), u);
+          _mm512_storeu_ps(fo_row + r * N, vlo);
 
-        // hi half (cols n0+16..n0+31)
-        icg = _mm512_loadu_si512(cg_hi + r * 16);
-        icu = _mm512_loadu_si512(cu_hi + r * 16);
-        g = _mm512_mul_ps(_mm512_mul_ps(
-            _mm512_cvtepi32_ps(_mm512_sub_epi32(icg, vbc_g1)), vas), vbs_g1);
-        u = _mm512_mul_ps(_mm512_mul_ps(
-            _mm512_cvtepi32_ps(_mm512_sub_epi32(icu, vbc_u1)), vas), vbs_u1);
-        __m512 vhi = _mm512_mul_ps(silu_ps(g), u);
-        _mm512_storeu_ps(fo_row + r * N + 16, vhi);
+          // hi half (cols n0+16..n0+31)
+          icg = _mm512_loadu_si512(cg_hi + r * 16);
+          icu = _mm512_loadu_si512(cu_hi + r * 16);
+          g = _mm512_mul_ps(_mm512_mul_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(icg, vbc_g1)), vas), vbs_g1);
+          u = _mm512_mul_ps(_mm512_mul_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(icu, vbc_u1)), vas), vbs_u1);
+          __m512 vhi = _mm512_mul_ps(silu_ps(g), u);
+          _mm512_storeu_ps(fo_row + r * N + 16, vhi);
 
-        // amax tracking: vector-wise max across both halves.
-        __m512 ax = _mm512_max_ps(_mm512_andnot_ps(signBit, vlo),
-                                  _mm512_andnot_ps(signBit, vhi));
-        float av = _mm512_reduce_max_ps(ax);
-        float cur = my_amax[r];
-        if (av > cur) my_amax[r] = av;
+          // amax tracking: vector-wise max across both halves.
+          __m512 ax = _mm512_max_ps(_mm512_andnot_ps(signBit, vlo),
+                                    _mm512_andnot_ps(signBit, vhi));
+          float av = _mm512_reduce_max_ps(ax);
+          float cur = my_amax[m0 + r];
+          if (av > cur) my_amax[m0 + r] = av;
+        }
+        m0 += 64;
+      }
+
+      // ---- Cold tail: 32-row block, only when M%64 == 32. ----
+      // __builtin_expect(...,0) hints the compiler to lay this branch out in
+      // a cold section so the hot M=64 path stays compact in icache.
+      if (__builtin_expect(m0 < M, 0)) {
+        const uint8_t* A = qi + m0 * K;
+        const float*   Ag = qisc + m0;
+        float* fo_row = f_scratch + m0 * N + n0;
+
+        amx_gemm_32x16_gu(A, K, Bg_lo, Bu_lo, cg_lo, cu_lo, K);
+        amx_gemm_32x16_gu(A, K, Bg_hi, Bu_hi, cg_hi, cu_hi, K);
+
+        for (int r = 0; r < 32; ++r) {
+          __m512 vas = _mm512_set1_ps(Ag[r]);
+          __m512i icg = _mm512_loadu_si512(cg_lo + r * 16);
+          __m512i icu = _mm512_loadu_si512(cu_lo + r * 16);
+          __m512 g = _mm512_mul_ps(_mm512_mul_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(icg, vbc_g0)), vas), vbs_g0);
+          __m512 u = _mm512_mul_ps(_mm512_mul_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(icu, vbc_u0)), vas), vbs_u0);
+          __m512 vlo = _mm512_mul_ps(silu_ps(g), u);
+          _mm512_storeu_ps(fo_row + r * N, vlo);
+
+          icg = _mm512_loadu_si512(cg_hi + r * 16);
+          icu = _mm512_loadu_si512(cu_hi + r * 16);
+          g = _mm512_mul_ps(_mm512_mul_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(icg, vbc_g1)), vas), vbs_g1);
+          u = _mm512_mul_ps(_mm512_mul_ps(
+              _mm512_cvtepi32_ps(_mm512_sub_epi32(icu, vbc_u1)), vas), vbs_u1);
+          __m512 vhi = _mm512_mul_ps(silu_ps(g), u);
+          _mm512_storeu_ps(fo_row + r * N + 16, vhi);
+
+          __m512 ax = _mm512_max_ps(_mm512_andnot_ps(signBit, vlo),
+                                    _mm512_andnot_ps(signBit, vhi));
+          float av = _mm512_reduce_max_ps(ax);
+          float cur = my_amax[m0 + r];
+          if (av > cur) my_amax[m0 + r] = av;
+        }
       }
     }
 
@@ -814,11 +872,12 @@ at::Tensor shared_expert_amx_impl(
     if (_timing && tid == 0) _t_s1 = now_ns();
 
     // ---- Stage 1.5 (fused reduce + requant): each thread redundantly
-    // computes per-row inv from amax_tpr (cheap: M*nthr fp32 = 8KB read,
-    // M=64 fp32 written), then requantizes its nb-slice of f_scratch -> qi2.
+    // computes per-row inv from amax_tpr (cheap: M*nthr fp32 read,
+    // M*4 bytes written), then requantizes its nb-slice of f_scratch -> qi2.
     // Eliminates the barrier between reduce and requant (saves ~5us at 32
-    // threads), at the cost of nthr-fold redundant compute on a 2KB buffer.
-    alignas(64) float local_inv[64];
+    // threads), at the cost of nthr-fold redundant compute on a small buffer.
+    // Stack-allocated; sized for typical batch sizes (cap = 1024 → 4KB).
+    alignas(64) float local_inv[1024];
     {
       for (int64_t m0 = 0; m0 < M; m0 += 16) {
         int64_t chunk = std::min<int64_t>(16, M - m0);
@@ -861,10 +920,11 @@ at::Tensor shared_expert_amx_impl(
 
     // ---- Stage 2: W2 gemm + dequant + scaled add -> bf16 out.
     // 32 M-rows × 32 N-cols paired tile (B_lo + B_hi loaded together so A is
-    // streamed only once per K-iter for both halves). Outer mb=2 loop covers
-    // M=64. The 64x16 single-pass scheme regressed here: K=2048 is too short
-    // for the per-call setup amortization to dominate, and A2 is tiny (128KB)
-    // so it's L2-resident anyway, making the mb=2 retread effectively free.
+    // streamed only once per K-iter for both halves). Outer mb loop iterates
+    // M/32 chunks. The 64x16 single-pass scheme regressed here: K=2048 is too
+    // short for the per-call setup amortization to dominate, and A2 is small
+    // (M×N bytes) so it's L2-resident anyway, making the mb retread cheap.
+    const int64_t MB2 = M / 32;
     alignas(64) int32_t cacc[32 * 32];
     #pragma omp for schedule(static) nowait
     for (int64_t nb = 0; nb < NB2; ++nb) {
@@ -876,7 +936,7 @@ at::Tensor shared_expert_amx_impl(
       __m512i vbc_lo = _mm512_loadu_si512(w2_bc + oc0);
       __m512i vbc_hi = _mm512_loadu_si512(w2_bc + oc0 + 16);
 
-      for (int64_t mb = 0; mb < 2; ++mb) {
+      for (int64_t mb = 0; mb < MB2; ++mb) {
         int64_t m0 = mb * 32;
         const uint8_t* A = qi2 + m0 * N;
         amx_gemm_32x32(A, N, B_lo, B_hi, cacc, N);
