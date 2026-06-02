@@ -2,8 +2,11 @@
 // Hand-rolled AMX INT8 shared-expert kernel for the SwiGLU MLP block.
 //
 // Compute: out[M, K] = SiLU(X·W1_g)·(X·W1_u)·W2 + routed_scaling * fused_out
-// where X is bf16 [M, K], W1 is int8 [K, 2N] (gate/up concatenated along N),
-// W2 is int8 [N, K], and routed_scaling/fused_out come from MoE routing.
+// where X is bf16 [M, K], W1 is int8 [2N, K] (gate/up concatenated along the
+// 2N output rows), W2 is int8 [K, N], and routed_scaling/fused_out come from
+// MoE routing. NOTE: W1/W2 use the same (output-channel-major) raw orientation
+// as the BRGEMM baseline (moe_int8.cpp: w1 [2N, K], w2 [K, N] = [OC, IC]); this
+// kernel re-packs them into its own VNNI super-block layout on first sight.
 //
 // Pipeline stages (all run in a single OMP parallel region; barriers between):
 //   Stage 0:    Quantize X (bf16 -> u8) row-parallel, per-row dynamic scale.
@@ -223,15 +226,23 @@ static inline __m512 silu_ps(__m512 g) {
   __m512 neg = _mm512_sub_ps(_mm512_setzero_ps(), g);
   __m512 sig = _mm512_div_ps(one, _mm512_add_ps(one, _mm512_fast_exp_ps(neg)));
   return _mm512_mul_ps(g, sig);
+  // NOTE: a vdivps -> rcp14+1NR replacement was tried (bit-accurate to ~2^-28,
+  // far under the 5% budget) and micro-benchmarked at 32 threads: 0.999x, i.e.
+  // no measurable gain — the Stage-1 post-loop is store/throughput-bound, not
+  // divide-latency-bound, and nothing else contends for the divide port. Left
+  // the exact div form. Don't "optimize" this without a full-kernel measurement.
 }
 #endif
 
-// VNNI packer for s8 [K, N] row-major -> [N/16, K/4, 16, 4]. AMX INT8 B-tile
-// expects each "row" to hold 16 N-cols × 4 K-bytes = 64 bytes; a tile is 16
-// such rows. We emit NB sub-blocks of 16 N-cols each, contiguous in memory
-// per sub-block so tile_loadd streams sequentially with stride 64 bytes.
-// Bcomp = 128 * sum_K(W) is precomputed per N-col so dpbusd's `(A+128)·W`
-// result can be corrected to `A·W` by subtracting bcomp at dequant time.
+// VNNI packer for s8 -> [N/16, K/4, 16, 4], where K is the contraction dim and
+// N the output dim. The source is OUTPUT-major `[N, K]` row-major (= the BRGEMM
+// baseline's `[OC, IC]` raw layout), so the 4 contraction values that pack into
+// one VNNI quad are CONTIGUOUS in src. AMX INT8 B-tile expects each "row" to
+// hold 16 N-cols × 4 K-bytes = 64 bytes; a tile is 16 such rows. We emit NB
+// sub-blocks of 16 N-cols each, contiguous in memory per sub-block so tile_loadd
+// streams sequentially with stride 64 bytes. Bcomp = 128 * sum_K(W) is
+// precomputed per N-col so dpbusd's `(A+128)·W` result can be corrected to
+// `A·W` by subtracting bcomp at dequant time.
 // Used for W2 (Stage 2). W1 uses a different layout — see pack_w1_vnni.
 static void pack_b_vnni_s8(
     int8_t* __restrict__ dst, int32_t* __restrict__ bcomp,
@@ -251,10 +262,12 @@ static void pack_b_vnni_s8(
     for (int64_t k4 = 0; k4 < K4; ++k4) {
       for (int n = 0; n < BLOCK_N; ++n) {
         int col = (int)(nb * BLOCK_N + n);
-        int8_t s0 = src[(k4 * 4 + 0) * N + col];
-        int8_t s1 = src[(k4 * 4 + 1) * N + col];
-        int8_t s2 = src[(k4 * 4 + 2) * N + col];
-        int8_t s3 = src[(k4 * 4 + 3) * N + col];
+        // src is `[N, K]` (output-major): the 4 K-values are contiguous.
+        const int8_t* sp = src + (int64_t)col * K + k4 * 4;
+        int8_t s0 = sp[0];
+        int8_t s1 = sp[1];
+        int8_t s2 = sp[2];
+        int8_t s3 = sp[3];
         int64_t off = k4 * (BLOCK_N * 4) + n * 4;
         dp[off + 0] = s0;
         dp[off + 1] = s1;
@@ -269,13 +282,15 @@ static void pack_b_vnni_s8(
   }
 }
 
-// W1 packer (input s8 [K, 2N] gate||up). Layout: NB32 super-blocks of 4
-// adjacent VNNI sub-blocks {gate-lo, gate-hi, up-lo, up-hi}, each covering
-// 16 N-cols. Adjacency matters: the Stage-1 GEMM consumes all 4 sub-blocks
-// of a super in sequence per thread, so each thread reads its W1 slice as
-// one big forward stream (vs. having gate-lo and up-lo N/2 bytes apart in
-// the standard pack_b_vnni_s8 layout). Bcomp computed per col, indexed
-// the same as the original [2N] layout (gate cols 0..N-1, up cols N..2N-1).
+// W1 packer (input s8 [2N, K] gate||up over the 2N output rows). Layout: NB32
+// super-blocks of 4 adjacent VNNI sub-blocks {gate-lo, gate-hi, up-lo, up-hi},
+// each covering 16 N-cols. Adjacency matters: the Stage-1 GEMM consumes all 4
+// sub-blocks of a super in sequence per thread, so each thread reads its W1
+// slice as one big forward stream (vs. having gate-lo and up-lo N/2 bytes apart
+// in the standard pack_b_vnni_s8 layout). The source is OUTPUT-major `[2N, K]`
+// (= BRGEMM baseline raw layout), so the 4 contraction values that form one
+// VNNI quad are CONTIGUOUS in src. Bcomp computed per output-col, indexed the
+// same as the [2N] output ordering (gate cols 0..N-1, up cols N..2N-1).
 static void pack_w1_vnni(
     int8_t* __restrict__ dst, int32_t* __restrict__ bcomp,
     const int8_t* __restrict__ w1_data,
@@ -297,15 +312,13 @@ static void pack_w1_vnni(
     const int g_base = (int)(nb32 * 32);
     const int u_base = (int)(N + nb32 * 32);
     for (int64_t k4 = 0; k4 < K4; ++k4) {
-      const int8_t* row0 = w1_data + (k4 * 4 + 0) * (2 * N);
-      const int8_t* row1 = w1_data + (k4 * 4 + 1) * (2 * N);
-      const int8_t* row2 = w1_data + (k4 * 4 + 2) * (2 * N);
-      const int8_t* row3 = w1_data + (k4 * 4 + 3) * (2 * N);
       int64_t off = k4 * (16 * 4);
+      // src `[2N, K]`: output row `col` at w1_data + col*K, 4 K-values contiguous.
       auto emit_sub = [&](int col_base, int8_t* sp, int32_t* sum) {
         for (int n = 0; n < 16; ++n) {
           int col = col_base + n;
-          int8_t s0 = row0[col], s1 = row1[col], s2 = row2[col], s3 = row3[col];
+          const int8_t* wp = w1_data + (int64_t)col * K + k4 * 4;
+          int8_t s0 = wp[0], s1 = wp[1], s2 = wp[2], s3 = wp[3];
           sp[off + n * 4 + 0] = s0;
           sp[off + n * 4 + 1] = s1;
           sp[off + n * 4 + 2] = s2;
@@ -401,7 +414,8 @@ static WeightEntry& get_or_build_entry(
       e.w1_pack.data_ptr<int8_t>(), e.w1_bcomp.data_ptr<int32_t>(),
       w1_data, K, N);
 
-  // W2: input is s8 [N, K] (row-major). Pack into [K/16, N/4, 16, 4].
+  // W2: input is s8 [K, N] = [OC, IC] (row-major, BRGEMM baseline layout;
+  // contraction dim is N). Pack into [K/16, N/4, 16, 4].
   e.w2_pack = at::empty({N * K}, at::kChar);
   e.w2_bcomp = at::empty({K}, at::kInt);
   pack_b_vnni_s8(
@@ -509,6 +523,11 @@ static ALWAYS_INLINE void amx_gemm_32x32(
 //            displace A and the C-acc scratches.
 //   tmm7:    unused
 // Per K-iter: 1 B-load + 4 A-loads + 4 dpbusd.
+//
+// NOTE: a 3-A-tile variant (tmm4,5,7) that breaks the per-iter WAR reload was
+// tried and micro-benchmarked cold (32 threads, 1numa & 2numa); it measured
+// 1-3% SLOWER, not faster — the 2-tile alternation already hides the reload
+// under dpbusd throughput. Kept the 2-tile form. Don't "fix" the unused tmm7.
 static ALWAYS_INLINE void amx_gemm_64x16(
     const uint8_t* __restrict__ A, int64_t ld_a_bytes,
     const int8_t* __restrict__ B,
@@ -547,8 +566,8 @@ static ALWAYS_INLINE void amx_gemm_64x16(
 
 at::Tensor shared_expert_amx_impl(
     at::Tensor& hidden_states,
-    at::Tensor& w1,           // s8 [K, 2N]
-    at::Tensor& w2,           // s8 [N, K]
+    at::Tensor& w1,           // s8 [2N, K]  (gate||up over 2N output rows)
+    at::Tensor& w2,           // s8 [K, N]   ([OC, IC], same as BRGEMM baseline)
     at::Tensor& fused_out,    // bf16 [M, K]
     double routed_scaling_factor,
     const at::Tensor& w1_scale,
@@ -563,10 +582,10 @@ at::Tensor shared_expert_amx_impl(
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
-  int64_t N = w1.size(1) / 2;
-  CHECK_EQ(w1.size(0), K);
-  CHECK_EQ(w2.size(0), N);
-  CHECK_EQ(w2.size(1), K);
+  int64_t N = w1.size(0) / 2;   // w1 is [2N, K]
+  CHECK_EQ(w1.size(1), K);
+  CHECK_EQ(w2.size(0), K);
+  CHECK_EQ(w2.size(1), N);
   CHECK_EQ(w1_scale.numel(), 2 * N);
   CHECK_EQ(w2_scale.numel(), K);
 
