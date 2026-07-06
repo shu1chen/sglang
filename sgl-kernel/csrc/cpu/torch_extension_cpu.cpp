@@ -205,6 +205,18 @@ at::Tensor shared_expert_amx_cpu(
     const at::Tensor& w1_scale,
     const at::Tensor& w2_scale);
 
+#ifdef SGL_USE_ONEDNN_UKERNEL
+// shared expert (baseline int8 kernel, brgemm issued via oneDNN ukernel API)
+at::Tensor shared_expert_onednn_brgemm_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& fused_experts_out,
+    double routed_scaling_factor,
+    const at::Tensor& w1_scale,
+    const at::Tensor& w2_scale);
+#endif
+
 // fused moe
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
@@ -488,6 +500,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "shared_expert_amx_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor fused_experts_out, "
       "float routed_scaling_factor, Tensor w1_scale, Tensor w2_scale) -> Tensor");
   m.impl("shared_expert_amx_cpu", torch::kCPU, &shared_expert_amx_cpu);
+
+#ifdef SGL_USE_ONEDNN_UKERNEL
+  // shared expert (baseline int8 kernel, brgemm issued via oneDNN ukernel API)
+  m.def(
+      "shared_expert_onednn_brgemm_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor fused_experts_out, "
+      "float routed_scaling_factor, Tensor w1_scale, Tensor w2_scale) -> Tensor");
+  m.impl("shared_expert_onednn_brgemm_cpu", torch::kCPU, &shared_expert_onednn_brgemm_cpu);
+#endif
   // weight absorption
   m.def(
       "qkv_proj_with_rope(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor "

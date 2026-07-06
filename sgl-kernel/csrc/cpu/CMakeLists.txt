@@ -44,8 +44,31 @@ if(EXISTS "${DNNL_ROOT}/include/oneapi/dnnl/dnnl.hpp")
     link_directories(${DNNL_BUILD}/src)
     find_library(DNNL_LIB dnnl HINTS "${DNNL_BUILD}/src")
     add_compile_definitions(SGL_USE_ONEDNN)
+
+    # The public ukernel BRGeMM API (dnnl::ukernel::brgemm) is only compiled in
+    # when oneDNN was built with -DDNNL_EXPERIMENTAL_UKERNEL=ON, which emits
+    # `#define DNNL_EXPERIMENTAL_UKERNEL` into the generated dnnl_config.h. Look
+    # for it in either the source-tree include or the build-tree include.
+    set(USE_ONEDNN_UKERNEL ON)
+    foreach(_cfg
+            "${DNNL_ROOT}/include/oneapi/dnnl/dnnl_config.h"
+            "${DNNL_BUILD}/include/oneapi/dnnl/dnnl_config.h")
+        if(EXISTS "${_cfg}")
+            file(STRINGS "${_cfg}" _ukernel_line
+                 REGEX "^#define[ \t]+DNNL_EXPERIMENTAL_UKERNEL")
+            if(_ukernel_line)
+                set(USE_ONEDNN_UKERNEL ON)
+            endif()
+        endif()
+    endforeach()
+    if(USE_ONEDNN_UKERNEL)
+        message(STATUS "oneDNN ukernel BRGeMM API available (DNNL_EXPERIMENTAL_UKERNEL)")
+    else()
+        message(STATUS "oneDNN ukernel BRGeMM API NOT available; skipping moe_int8_shared_expert_onednn_brgemm.cpp")
+    endif()
 else()
     set(USE_ONEDNN OFF)
+    set(USE_ONEDNN_UKERNEL OFF)
     message(STATUS "oneDNN not found, skipping moe_int8_onednn.cpp")
 endif()
 
@@ -115,6 +138,13 @@ add_compile_options(
 
 if(NOT USE_ONEDNN)
     list(FILTER SOURCES EXCLUDE REGEX "(moe_int8_matmul|moe_int8_shared_expert_onednn)\\.cpp$")
+endif()
+
+# The ukernel-brgemm shared-expert variant needs the experimental ukernel API.
+if(NOT USE_ONEDNN_UKERNEL)
+    list(FILTER SOURCES EXCLUDE REGEX "moe_int8_shared_expert_onednn_brgemm\\.cpp$")
+else()
+    add_compile_definitions(SGL_USE_ONEDNN_UKERNEL)
 endif()
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
